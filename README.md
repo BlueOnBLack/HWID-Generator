@@ -29,7 +29,7 @@ Ensure the following DLLs are available in a `\SppDll\` subdirectory:
 $Key = "XXXXX-XXXXX-XXXXX-XXXXX-XXXXX"
 $BinaryKey = Encode-ProductKey -ProductKey $Key
 ````
-###⚠️ Disclaimer
+### Disclaimer ⚠️
 This project is intended for educational and reverse-engineering research purposes only. Interfacing with Microsoft licensing components may violate Terms of Service in certain environments. This toolkit provides a manual pathway to IID generation that bypasses standard high-level SL API wrappers. Use responsibly.
 ### Demo Code
 ```powershell
