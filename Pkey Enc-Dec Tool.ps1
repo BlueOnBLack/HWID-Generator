@@ -549,31 +549,35 @@ function Extract-KeyInfo {
     # $serial   = [Marshal]::ReadInt32(a2, 0x04)
     # $security = [Marshal]::ReadInt32(a2, 0x10)
 
-    # 1. Group ID is a straight UInt16 from the start
+    # 1. Group ID: Straight UInt16
     $groupId = [BitConverter]::ToUInt16($BinaryKey, 0)
 
-    # 2. Serial Logic (The first do-while loop)
-    # v24 = Byte[3], v35[v23+2] = Byte[2]
-    # Serial = (16 * Byte3) | (Byte2 >> 4)
-    # Note: The assembly actually builds a larger 32-bit serial across the loop, 
-    # but for most keys, the primary Serial value is here:
-    $serial = ([int]$BinaryKey[3] * 16) -bor ($BinaryKey[2] -shr 4)
+    # 2. Serial Logic: Fixed with 0xFF mask
+    $serialBytes = New-Object byte[] 4 
+    for ($i = 0; $i -lt 3; $i++) {
+        # Mask the result to 8 bits to stay within [byte] limits
+        $rawSerial = (($BinaryKey[$i + 3] -band 0xFF) -shl 4) -bor ($BinaryKey[$i + 2] -shr 4)
+        $serialBytes[$i] = [byte]($rawSerial -band 0xFF)
+    }
+    $serial = [BitConverter]::ToUInt32($serialBytes, 0)
 
-    # 3. Security Logic (The second do-while loop)
-    # v28 = Byte[7], v35[v27+6] = Byte[6]
-    # Security = (Byte7 << 6) | (Byte6 >> 2)
-    $security = (([int]$BinaryKey[7] -band 0xFF) -shl 6) -bor ($BinaryKey[6] -shr 2)
+    # 3. Security Logic: Fixed with 0xFF mask
+    $securityBytes = New-Object byte[] 8
+    for ($i = 0; $i -lt 6; $i++) {
+        # Mask the result to 8 bits to stay within [byte] limits
+        $rawSec = (($BinaryKey[$i + 7] -band 0xFF) -shl 6) -bor ($BinaryKey[$i + 6] -shr 2)
+        $securityBytes[$i] = [byte]($rawSec -band 0xFF)
+    }
+    $security = [BitConverter]::ToUInt64($securityBytes, 0)
 
     # 4. Modern N Flag
-    # _mm_srli_si128(v7, 8) shifts right by 8 bytes.
-    # The original Byte 14 and 15 move to positions 6 and 7 of the new chunk.
-    # HIWORD then grabs those bits.
     $isNKey = ($BinaryKey[14] -band 0x08) -ne 0
 
     return [Psobject]@{
-       Group     = $groupId
-       Serial    = $serial
-       Security  = $security
+        Group    = $groupId
+        Serial   = $serial
+        Security = $security
+        IsNKey   = $isNKey
     }
 }
 function Invoke-IIDRequest {
@@ -786,6 +790,13 @@ if ($EncResult.Success) {
     }
 }
 
+if ($IsForge) {
+    $Req = Invoke-IIDRequest `
+        -UseApi -ApiMode SLGenerateOfflineInstallationIdEx `
+        -SkuID $SkuID
+    Write-Host (" - Offline  Call Api : {0}" -f $Req)
+}
+
 $Info = Extract-KeyInfo `
     -BinaryKey $EncResult.BinaryKey
 $Req = Invoke-IIDRequest `
@@ -795,14 +806,7 @@ $Req = Invoke-IIDRequest `
     -HWID $hwid.ShortHWID `
     -DllPath $pidIns `
     -Mode Insider
-Write-Host (" - Offline  Call Api : {0}" -f $Req.IID)
-
-if ($IsForge) {
-    $Req = Invoke-IIDRequest `
-        -UseApi -ApiMode SLGenerateOfflineInstallationIdEx `
-        -SkuID $SkuID
-    Write-Host (" - PKeyData Call Api : {0}" -f $Req)
-}
+Write-Host (" - PKeyData Call Api : {0}" -f $Req.IID)
 
 if ($IsForge) {
     $Req = Invoke-IIDRequest `
