@@ -1,4 +1,5 @@
 ﻿using namespace System
+using namespace System.Management.Automation
 using namespace System.Runtime.InteropServices
 Import-Module NativeInteropLib -ErrorAction Stop
 
@@ -8,66 +9,181 @@ $pidGen = (Join-Path $PSScriptRoot "SppDll\pidgenx.dll")
 $winRT  = (Join-Path $PSScriptRoot "SppDll\LicensingWinRT.dll")
 $pidIns = (Join-Path $PSScriptRoot "SppDll\pidgenxInsider.dll")
 
+$IsForge = ([PSTypeName]'LibTSforge.SPP.ProductConfig').Type
+
 # API: LicensingWinRT.dll
 # __int64 __fastcall GetDownlevelPkeyData(unsigned __int8 *a1, __int64 a2, __int64 a3, __int64 a4)
+# __int64 __fastcall HwidGetCurrentEx(unsigned __int8 *a1, int a2, struct _HWID **a3, unsigned int *a4, int **a5, unsigned int *a6)
 # __int64 __fastcall _HWID::ConvertToShort(_HWID *this, __int64 *a2)
+
+# Spp Store
+# Get-SppStoreLicense -SkuType Windows -IgnoreEsu -Dump | ? Value -match 'current' | select -First 1
+
 function Get-ProductHWID {
-    [CmdletBinding()]
+    [CmdletBinding(DefaultParameterSetName = 'Manual')]
     param (
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $true, ParameterSetName = 'Manual')]
         [string]$CdKey,
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'Store')]
+        [switch]$FromStore,
 
         [Parameter(Mandatory = $false)]
         [string]$DllPath = "LicensingWinRT.dll",
 
         [Parameter(Mandatory = $false)]
-        [Int64]$Offset = 0x18002DD10
+        [Int64]$Offset = 0x18002DD10,
+
+        [switch]$UseApi
     )
 
+    function Hwid-ConvertToLargeInt {
+        param ([byte[]]$Raw)
+
+        # State tracking: Use [int64] internally to prevent overflow during calculation
+        $S = [PSCustomObject]@{ P = 28; L = [int64]0; H = [int64]0; S = 0 }
+
+        $Pack = {
+            param([int]$idx, [int]$bits, [int]$shift, [int64]$mask, [bool]$isHigh, $sShift)
+        
+            $cnt = [BitConverter]::ToUInt16($Raw, $idx * 2)
+            if ($cnt -eq 0) { return }
+
+            $v4 = [BitConverter]::ToUInt16($Raw, $S.P)
+            for ($i=0; $i -lt $cnt; $i++) {
+                $val = [BitConverter]::ToUInt16($Raw, $S.P + ($i * 2))
+                if (($val -band 1) -eq 0) { $v4 = $val; break }
+            }
+            $S.S = ($v4 -band 1)
+        
+            $m = (1 -shl $bits) - 1
+            $hash = $m -band ($v4 -shr 1)
+            if ($hash -eq 0) { $hash = $m }
+
+            # Logic: Perform bitwise as Int64, then mask to 32-bit to mimic register overflow
+            if ($isHigh) {
+                $valToXor = ([int64]$hash -shl $shift)
+                $S.H = ($S.H -bxor (($S.H -bxor $valToXor) -band $mask)) -band 0xFFFFFFFF
+            } else {
+                $valToXor = ([int64]$hash -shl $shift)
+                $S.L = ($S.L -bxor (($S.L -bxor $valToXor) -band $mask)) -band 0xFFFFFFFF
+            }
+
+            if ($null -ne $sShift) {
+                $S.L = ($S.L -bxor (($S.L -bxor ($S.L -bor ($S.S -shl $sShift))) -band 0x7C0)) -band 0xFFFFFFFF
+            }
+
+            $S.P += (2 * $cnt)
+        }
+
+        # Header Logic
+        $v3 = [BitConverter]::ToUInt16($Raw, 26)
+        if ($v3) { 
+            $v6 = (($v3 -shr 1) -band 0x3F)
+            $S.L = if ($v6) { [int64]$v6 } else { [int64]63 }
+        }
+
+        $v8 = [BitConverter]::ToUInt16($Raw, 24)
+        if ($v8) { 
+            $v9 = (($v8 -shr 1) -band 7)
+            $v10 = if ($v9) { $v9 } else { 7 }
+            $S.H = ([int64]$v10 -shl 29) -band 0xFFFFFFFF
+        }
+
+        # Word 2-10 (Full Implementation)
+        &$Pack 2  7 21 0xFE00000    $false 6
+        &$Pack 3  4 28 0xF0000000   $false $null
+        &$Pack 4  7 9  0xFE00       $true  7
+        &$Pack 5  5 21 0x3E00000    $true  $null
+        &$Pack 6  5 16 0x1F0000     $true  8
+        &$Pack 7  6 3  0x1F8        $true  9
+    
+        $S.P += (2 * [BitConverter]::ToUInt16($Raw, 16)) 
+    
+        &$Pack 9  10 11 0x1FF800    $false 10
+        &$Pack 10 3  26 0x1C000000   $true  $null
+
+        # Merge High and Low into final 64-bit ID
+        $final = ([int64]$S.H -shl 32) -bor ([uint32]$S.L)
+        return $final
+    }
     
     try {
+        # --- Parameter Set: Store ---
+        if ($PSCmdlet.ParameterSetName -eq 'Store') {
+            if(!([PSTypeName]'LibTSforge.SPP.ProductConfig').Type) {
+                Write-Warning "Missing nececery libraries !"
+                Write-Warning "Please load first PkeyConsole"
+                return
+            }
+            $dataBlock = Get-SppStoreLicense -SkuType Windows -IgnoreEsu -Dump | 
+                            Where-Object Value -match 'current' | 
+                            Select-Object -First 1
 
-        $cdKeyBytes = New-IntPtr -Data (Encode-ProductKey -ProductKey $CdKey)
+            if ($dataBlock) {
+                # Assuming .Data contains the 0x118 buffer
+                return [PSCustomObject]@{
+                    Success   = $true
+                    Source    = "SPP Store"
+                    HResult   = "0x00000000"
+                    HWIDPtr   = New-IntPtr -Data ($dataBlock.Raw)
+                    RawBytes  = $dataBlock.Raw
+                    ShortHWID = $(if ($UseApi) {Convert-HWIDToShort -HWIDStruct $dataBlock.Raw } else {Hwid-ConvertToLargeInt -Raw $dataBlock.Raw})
+                }
+            }
+            throw "No 'current' license block found in SPP Store."
+        }
+
+        # --- Parameter Set: Manual (DLL Invoke) ---
+        $Enc        = Get-PidGenEncoder -ProductKey $Key -Modern
+        $cdKeyBytes = New-IntPtr -Data $Enc.BinaryKey
         $hwidStruct = [IntPtr]::Zero
         $shortHwid  = [UInt32]0
-
         $a5 = [IntPtr]::Zero
         $a6 = [Uint64]0L
 
         $params = @(
-            $cdKeyBytes,        # a1: unsigned char*
-            0,                  # a2: int
-            [ref]$hwidStruct,   # a3: HWID**
-            [ref]$shortHwid,    # a4: uint*
-            $a5,                # a5: int**
-            $a6                 # a6: uint*
+            $cdKeyBytes,      # a1
+            0,                # a2
+            [ref]$hwidStruct, # a3
+            [ref]$shortHwid,  # a4
+            $a5,              # a5
+            $a6               # a6
         )
-        $hr = Invoke-UnmanagedMethod `
-            -Dll $DllPath `
-            -Function "Inner" `
-            -Values $params `
-            -Sub $Offset
 
-        if ($hr -ge 0) {
+        $hr = Invoke-UnmanagedMethod -Dll $DllPath -Function "Inner" -Values $params -Sub $Offset
+
+        if ($hr -ge 0 -and $hwidStruct -ne [IntPtr]::Zero) {
+            $structSize = 0x118 
+            $byteArray = New-Object Byte[] $structSize
+            [System.Runtime.InteropServices.Marshal]::Copy($hwidStruct, $byteArray, 0, $structSize)
+
             return [PSCustomObject]@{
-                Success     = $true
-                HResult     = "0x$($hr.ToString('X8'))"
-                HWIDPtr     = $hwidStruct
-                ShortHWID   = $shortHwid
+                Success   = $true
+                Source    = "DLL Invoke"
+                HResult   = "0x$($hr.ToString('X8'))"
+                HWIDPtr   = $hwidStruct
+                RawBytes  = $byteArray 
+                ShortHWID = $(if ($UseApi) {Convert-HWIDToShort -HWIDStruct $byteArray } else {Hwid-ConvertToLargeInt -Raw $byteArray})
             }
-        } 
+        }
         else {
             return [PSCustomObject]@{
-                Success    = $false
-                HResult    = "0x$($hr.ToString('X8'))"
-                Error      = "HWID Extract failed."
+                Success = $false
+                HResult = "0x$($hr.ToString('X8'))"
+                Error   = "HWID Extract failed via DLL."
             }
         }
     }
+    catch {
+        Write-Error $_.Exception.Message
+    }
     finally {
+        # Clean up CdKey pointer if it was created
+        if ($cdKeyBytes) { Free-IntPtr $cdKeyBytes }
     }
 }
-function Convert-ToShort {
+function Convert-HWIDToShort {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
@@ -119,6 +235,7 @@ function Convert-ToShort {
 }
 
 # API: sppwinob.dll
+# API: pidgenx.dll / sppobjs.dll
 function Get-PidGenDecoder {
     [CmdletBinding()]
     param (
@@ -168,22 +285,95 @@ function Get-PidGenDecoder {
         [Marshal]::FreeHGlobal($outStrPtr)
     }
 }
-
-# API: pidgenx.dll / sppobjs.dll
 function Get-PidGenEncoder {
-    [CmdletBinding()]
+    [CmdletBinding(DefaultParameterSetName = 'Modern')]
     param (
-        [Parameter(Mandatory = $true)]
+        # ProductKey must be in BOTH sets to work everywhere
+        [Parameter(Mandatory = $true, ParameterSetName = 'Manual')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'Modern')]
         [string]$ProductKey,
 
-        [Parameter(Mandatory = $true)]
+        # Only used in Manual mode
+        [Parameter(Mandatory = $true, ParameterSetName = 'Manual')]
         [ValidateSet("pidgenx.dll", "sppobjs.dll")]
-        [string]$DllName,
+        [string]$DllName = 'pidgenx.dll',
 
-        [Parameter(Mandatory = $false)]
-        [string]$CustomPath = ''
+        # Custom path is optional, but belongs to Manual mode
+        [Parameter(Mandatory = $false, ParameterSetName = 'Manual')]
+        [string]$CustomPath = '',
+
+        # The switch that triggers the PS1-only logic
+        [Parameter(Mandatory = $true, ParameterSetName = 'Modern')]
+        [switch]$Modern
     )
 
+    # Local Helper
+    function EncodeKey {
+        [CmdletBinding()]
+        param (
+            [Parameter(Mandatory = $true)]
+            [string]$ProductKey
+        )
+
+        # Standard Microsoft Base24 Alphabet
+        $Alphabet = "BCDFGHJKMPQRTVWXY2346789"
+    
+        # Remove dashes and force uppercase
+        $RawKey = $ProductKey.Replace("-", "").ToUpper()
+        if ($RawKey.Length -ne 25) { throw "Key must be 25 characters." }
+
+        # This buffer holds the mapped values (0-23)
+        $Digits = New-Object byte[] 25
+        $isNKey = $false
+        $digitCount = 0
+
+        # --- Part 1: Map characters to Digits ---
+        # This handles the 'N' logic: if 'N' is found, we shift the 
+        # current buffer and place the position index at the start.
+        foreach ($char in $RawKey.ToCharArray()) {
+            if ($char -eq 'N') {
+                if (-not $isNKey) {
+                    $isNKey = $true
+                    # Manual shift (the 'memmove' from the DLL)
+                    for ($i = $digitCount; $i -gt 0; $i--) {
+                        $Digits[$i] = $Digits[$i-1]
+                    }
+                    $Digits[0] = [byte]$digitCount
+                    $digitCount++
+                    continue
+                }
+            }
+
+            $val = $Alphabet.IndexOf($char)
+            if ($val -lt 0) { throw "Invalid character in key: $char" }
+        
+            $Digits[$digitCount] = [byte]$val
+            $digitCount++
+        }
+
+        # --- Part 2: BigInt Conversion (Base24 -> Base256) ---
+        # We convert the 25 base-24 digits into a 16-byte binary array.
+        $Binary = New-Object byte[] 16
+    
+        foreach ($digit in $Digits) {
+            $carry = [uint32]$digit
+            for ($i = 0; $i -lt 16; $i++) {
+                # Standard "Multiply by Base and Add" BigInt logic
+                $res = ($Binary[$i] * 24) + $carry
+                $Binary[$i] = [byte]($res -band 0xFF)
+                $carry = $res -shr 8
+            }
+        }
+
+        # --- Part 3: Apply the Modern 'N' Bit ---
+        # In sub_180020C5C, this is the BYTE14 |= 8 logic.
+        if ($isNKey) {
+            $Binary[14] = $Binary[14] -bor 0x08
+        }
+
+        return $Binary
+    }
+    
     $binKeyPtr = [Marshal]::AllocHGlobal(0x10) 
     $flagPtr   = [Marshal]::AllocHGlobal(0x04)
 
@@ -198,18 +388,25 @@ function Get-PidGenEncoder {
         } elseif ($DllName -eq "sppobjs.dll") {
             $subAddress = 0x18013C8DC
         }
-
-        $DllPath = if ([String]::IsNullOrEmpty($CustomPath)) { $DllName } else { $CustomPath }
-        $hr = Invoke-UnmanagedMethod `
-            -Dll $DllPath `
-            -Function "Decode" `
-            -Values @($ProductKey, $binKeyPtr, [uint32]0x10, $flagPtr) `
-            -Sub $subAddress
+        
+        $hr = -1
+        if ($Direct.IsPresent) {
+            $hr = 0
+            $binBytes = EncodeKey -ProductKey $Key
+        } else {
+            $DllPath = if ([String]::IsNullOrEmpty($CustomPath)) { $DllName } else { $CustomPath }
+            $hr = Invoke-UnmanagedMethod `
+                -Dll $DllPath `
+                -Function "Decode" `
+                -Values @($ProductKey, $binKeyPtr, [uint32]0x10, $flagPtr) `
+                -Sub $subAddress
+            if ($hr -ge 0) {
+                $binBytes = New-Object byte[] 0x10
+                [Marshal]::Copy($binKeyPtr, $binBytes, 0, 0x10)
+            }
+        }
 
         if ($hr -ge 0) {
-            $binBytes = New-Object byte[] 0x10
-            [Marshal]::Copy($binKeyPtr, $binBytes, 0, 0x10)
-            
             return [PSCustomObject]@{
                 Success   = $true
                 BinaryKey = $binBytes
@@ -217,7 +414,7 @@ function Get-PidGenEncoder {
                 IsModernN = [bool]([Marshal]::ReadInt32($flagPtr))
                 HResult   = "0x$($hr.ToString('X8'))"
             }
-        } 
+        }
 
         return [PSCustomObject]@{ Success = $false; HResult = "0x$($hr.ToString('X8'))" }
     }
@@ -333,71 +530,6 @@ function Print-PidGenReport {
         Write-Host "[-] Failed to decode key. HRESULT: $($Result.HResult)" -ForegroundColor Red
     }
 }
-function Encode-ProductKey {
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory = $true)]
-        [string]$ProductKey
-    )
-
-    # Standard Microsoft Base24 Alphabet
-    $Alphabet = "BCDFGHJKMPQRTVWXY2346789"
-    
-    # Remove dashes and force uppercase
-    $RawKey = $ProductKey.Replace("-", "").ToUpper()
-    if ($RawKey.Length -ne 25) { throw "Key must be 25 characters." }
-
-    # This buffer holds the mapped values (0-23)
-    $Digits = New-Object byte[] 25
-    $isNKey = $false
-    $digitCount = 0
-
-    # --- Part 1: Map characters to Digits ---
-    # This handles the 'N' logic: if 'N' is found, we shift the 
-    # current buffer and place the position index at the start.
-    foreach ($char in $RawKey.ToCharArray()) {
-        if ($char -eq 'N') {
-            if (-not $isNKey) {
-                $isNKey = $true
-                # Manual shift (the 'memmove' from the DLL)
-                for ($i = $digitCount; $i -gt 0; $i--) {
-                    $Digits[$i] = $Digits[$i-1]
-                }
-                $Digits[0] = [byte]$digitCount
-                $digitCount++
-                continue
-            }
-        }
-
-        $val = $Alphabet.IndexOf($char)
-        if ($val -lt 0) { throw "Invalid character in key: $char" }
-        
-        $Digits[$digitCount] = [byte]$val
-        $digitCount++
-    }
-
-    # --- Part 2: BigInt Conversion (Base24 -> Base256) ---
-    # We convert the 25 base-24 digits into a 16-byte binary array.
-    $Binary = New-Object byte[] 16
-    
-    foreach ($digit in $Digits) {
-        $carry = [uint32]$digit
-        for ($i = 0; $i -lt 16; $i++) {
-            # Standard "Multiply by Base and Add" BigInt logic
-            $res = ($Binary[$i] * 24) + $carry
-            $Binary[$i] = [byte]($res -band 0xFF)
-            $carry = $res -shr 8
-        }
-    }
-
-    # --- Part 3: Apply the Modern 'N' Bit ---
-    # In sub_180020C5C, this is the BYTE14 |= 8 logic.
-    if ($isNKey) {
-        $Binary[14] = $Binary[14] -bor 0x08
-    }
-
-    return $Binary
-}
 function Extract-KeyInfo {
     [CmdletBinding()]
     param (
@@ -444,9 +576,18 @@ function Invoke-IIDRequest {
         [Parameter(Mandatory = $true, ParameterSetName = "FromStruct")]
         [byte[]]$RawStruct,
 
-        [Parameter(Mandatory = $true, ParameterSetName = "FromFields")] [int]$GroupID,
-        [Parameter(Mandatory = $true, ParameterSetName = "FromFields")] [int]$Serial,
-        [Parameter(Mandatory = $true, ParameterSetName = "FromFields")] [long]$SecurityID,
+        [Parameter(Mandatory = $true, ParameterSetName = "FromForge")]
+        [int]$GroupID,
+        [Parameter(Mandatory = $true, ParameterSetName = "FromForge")]
+        [int]$Serial,
+        [Parameter(Mandatory = $true, ParameterSetName = "FromForge")]
+        [long]$SecurityID,
+
+        [Parameter(Mandatory = $true, ParameterSetName = "FromAPI")]
+        [Switch]$UseApi,
+        [Parameter(Mandatory = $true, ParameterSetName = "FromAPI")]
+        [ValidateSet("GetPKeyData", "SLGenerateOfflineInstallationIdEx")]
+        [String]$ApiMode,
 
         [Parameter(Mandatory = $false)]
         [long]$HWID = 0,
@@ -456,7 +597,11 @@ function Invoke-IIDRequest {
 
         [ValidateSet("Retail", "Insider")]
         [Parameter(Mandatory = $false)]
-        [string]$Mode = "Retail"
+        [string]$Mode = "Retail",
+
+        [String]$Key,
+        [String]$ConfigPath,
+        [Nullable[Guid]]$SkuID
     )
 
     <#
@@ -499,72 +644,121 @@ function Invoke-IIDRequest {
     $buffer = New-Object byte[] $bufSize
     [Array]::Clear($buffer, 0, $buffer.Length)
 
-    if ($PSCmdlet.ParameterSetName -eq "FromStruct") {
+    $param = $PSCmdlet.ParameterSetName
+    if ($param -match "FromStruct|FromForge") {
+        if ($param -eq "FromStruct") {
         
-        # Copy the whole thing 1:1
-        [Array]::Copy($RawStruct, 0, $buffer, 0, [Math]::Min($RawStruct.Length, $bufSize))
+            # Copy the whole thing 1:1
+            [Array]::Copy($RawStruct, 0, $buffer, 0, [Math]::Min($RawStruct.Length, $bufSize))
     
-    } else {
+        } elseif (($param -eq "FromForge")) {
 
-        # FORGERY MODE: Start at Offset 8 to leave the header space
-        # This ensures that [IntPtr]::Add($hBuffer, 8) lands on our Signature
+            # FORGERY MODE: Start at Offset 8 to leave the header space
+            # This ensures that [IntPtr]::Add($hBuffer, 8) lands on our Signature
         
-        # 1. Signature (Starts at buffer index 8)
-        [BitConverter]::GetBytes([int]1711698671).CopyTo($buffer, 0x08)
-        [BitConverter]::GetBytes([int]1291679753).CopyTo($buffer, 0x0C)
-        [BitConverter]::GetBytes([int]-1220455283).CopyTo($buffer, 0x10)
-        [BitConverter]::GetBytes([int]-2004257797).CopyTo($buffer, 0x14)
+            # 1. Signature (Starts at buffer index 8)
+            [BitConverter]::GetBytes([int]1711698671).CopyTo($buffer, 0x08)
+            [BitConverter]::GetBytes([int]1291679753).CopyTo($buffer, 0x0C)
+            [BitConverter]::GetBytes([int]-1220455283).CopyTo($buffer, 0x10)
+            [BitConverter]::GetBytes([int]-2004257797).CopyTo($buffer, 0x14)
 
-        # 2. Identity (Indices adjusted +8)
-        [BitConverter]::GetBytes([int]$GroupID).CopyTo($buffer, 0x18) 
-        [BitConverter]::GetBytes([int]$Serial).CopyTo($buffer, 0x20)
-        [BitConverter]::GetBytes([long]$SecurityID).CopyTo($buffer, 0x28)
-    }
+            # 2. Identity (Indices adjusted +8)
+            [BitConverter]::GetBytes([int]$GroupID).CopyTo($buffer, 0x18) 
+            [BitConverter]::GetBytes([int]$Serial).CopyTo($buffer, 0x20)
+            [BitConverter]::GetBytes([long]$SecurityID).CopyTo($buffer, 0x28)
 
-    $hBuffer = [Marshal]::AllocHGlobal($bufSize)
-
-    try {
-        # v25 = sub_180006A94((__int64)v12 + 8
-        [Marshal]::Copy($buffer, 0, $hBuffer, $bufSize)
-
-        $pOutString = ''
-        $signatureBase = [IntPtr]::Add($hBuffer, 0x8)
-        $params = $signatureBase, 0L, [int64]$HWID, [int64]0L, [ref]$pOutString
-        [Int64]$offset = if($Mode -eq "Insider") { 0x180006A94 } else { 0x18001D8B8 }
-        $hr = Invoke-UnmanagedMethod `
-            -Dll $DllPath `
-            -Function "InnerCall" `
-            -Values $params `
-            -Sub $offset
-
-        if ($hr -ge 0) {
-            return [PSCustomObject]@{
-                Success = $true
-                IID     = $pOutString
-                HResult = "0x$($hr.ToString('X8'))"
-            }
         }
-        return [PSCustomObject]@{ Success = $false; HResult = "0x$($hr.ToString('X8'))" }
-    }
-    finally {
-        [Marshal]::FreeHGlobal($hBuffer)
+
+        $hBuffer = [Marshal]::AllocHGlobal($bufSize)
+
+        try {
+            # v25 = sub_180006A94((__int64)v12 + 8
+            [Marshal]::Copy($buffer, 0, $hBuffer, $bufSize)
+
+            $pOutString = ''
+            $signatureBase = [IntPtr]::Add($hBuffer, 0x8)
+            $params = $signatureBase, 0L, [int64]$HWID, [int64]0L, [ref]$pOutString
+            [Int64]$offset = if($Mode -eq "Insider") { 0x180006A94 } else { 0x18001D8B8 }
+            $hr = Invoke-UnmanagedMethod `
+                -Dll $DllPath `
+                -Function "InnerCall" `
+                -Values $params `
+                -Sub $offset
+
+            if ($hr -ge 0) {
+                return [PSCustomObject]@{
+                    Success = $true
+                    IID     = $pOutString
+                    HResult = "0x$($hr.ToString('X8'))"
+                }
+            }
+            return [PSCustomObject]@{ Success = $false; HResult = "0x$($hr.ToString('X8'))" }
+        }
+        finally {
+            [Marshal]::FreeHGlobal($hBuffer)
+        }
+
+    } elseif ($param -match 'FromAPI') {
+
+        if(!([PSTypeName]'LibTSforge.SPP.ProductConfig').Type) {
+            Write-Warning "Missing nececery libraries !"
+            Write-Warning "Please load first PkeyConsole"
+            return
+        }
+
+        if ($ApiMode -eq 'SLGenerateOfflineInstallationIdEx' -and (
+            $SkuID -and $SkuID -ne [Guid]::Empty)) {
+                $hSLC = Manage-SLHandle
+                $ppwszInstallation = $null
+                $ppwszInstallationIdPtr = [IntPtr]::Zero
+                $pProductSkuId = [Guid]$SkuID
+                $null = $Global:SLC::SLGenerateOfflineInstallationIdEx(
+                    $hSLC, [ref]$pProductSkuId, 0, [ref]$ppwszInstallationIdPtr)
+                if ($ppwszInstallationIdPtr -ne [IntPtr]::Zero) {
+                    return (
+                        [marshal]::PtrToStringAuto($ppwszInstallationIdPtr)
+                    )
+                }
+        } elseif ($ApiMode -eq 'GetPKeyData') {
+
+            $Pattern = '^[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}$'
+            if ([String]::IsNullOrEmpty($Key) -or $Key.ToUpper() -notmatch $Pattern) {
+                Write-Warning "Validation Error: '$Key' does not match the 5x5 format (XXXXX-XXXXX-XXXXX-XXXXX-XXXXX)."
+                return
+            }
+            if (-not (Test-Path $configPath)) {
+                Write-Warning  "Validation Error: PKeyConfig file not found at: $configPath"
+                return
+            }
+            return (
+                Get-PKeyData -key $Key -configPath $configPath -HWID $HWID
+            )
+        }
     }
 }
 
 Clear-Host
 Write-Host
 
-$Key = "7H674-NPCV7-7QVJ3-RQG68-78T77"
-$EncResult = Get-PidGenEncoder -ProductKey $Key -DllName sppobjs.dll -CustomPath $objs
+
+$Key        = "7H674-NPCV7-7QVJ3-RQG68-78T77"
+$SkuID      = [Guid]'ed655016-a9e8-4434-95d9-4345352c2552'
+$PKeyConfig = "C:\windows\System32\spp\tokens\pkeyconfig\pkeyconfig.xrm-ms"
+$EncResult  = Get-PidGenEncoder -ProductKey $Key -DllName sppobjs.dll -CustomPath $objs
 #$EncResult = Get-PidGenEncoder -ProductKey $Key -DllName pidgenx.dll -CustomPath $pidGen
 
+# Generate new one using Internal Api
 $hwid = Get-ProductHWID -CdKey $Key -DllPath $winRT
-#Dump-MemoryAddress -Pointer $hwid.HWIDPtr -Length 0x118
-$ShortHWID = Convert-ToShort -HWIDStruct $hwid.HWIDPtr -DllPath $winRT | select -ExpandProperty ShortHWID
+
+# Recover HWID directly fro SPP Store
+if ($IsForge) {  
+  $hwid = Get-ProductHWID -FromStore
+}
+
 
 Write-Host "--- AS BINARY OUTPUT ---" -ForegroundColor Cyan
-$HexBytes = [BitConverter]::ToString((Encode-ProductKey -ProductKey $Key))
-Write-Host "Generated Bytes: $HexBytes"
+$EncResult = Get-PidGenEncoder -ProductKey $Key -Modern
+Write-Host ("Generated Bytes: {0}" -f $EncResult.HexString)
 Write-Host
 
 if ($EncResult.Success) {
@@ -590,39 +784,38 @@ if ($EncResult.Success) {
     }
 }
 
-$hSLC = Manage-SLHandle
-$ppwszInstallation = $null
-$ppwszInstallationIdPtr = [IntPtr]::Zero
-$pProductSkuId = [Guid]'ed655016-a9e8-4434-95d9-4345352c2552'
-$null = $Global:SLC::SLGenerateOfflineInstallationIdEx(
-    $hSLC, [ref]$pProductSkuId, 0, [ref]$ppwszInstallationIdPtr)
-if ($ppwszInstallationIdPtr -ne [IntPtr]::Zero) {
-    $ppwszInstallation = [marshal]::PtrToStringAuto($ppwszInstallationIdPtr)
-    Write-Host " - Offline ^ Install : $ppwszInstallation"
-}
-
 $Info = Extract-KeyInfo -BinaryKey $EncResult.BinaryKey
 $Req = Invoke-IIDRequest `
     -GroupID $Info.Group `
     -Serial $Info.Serial `
     -SecurityID $Info.Security `
-    -HWID $ShortHWID `
+    -HWID $hwid.ShortHWID `
     -DllPath $pidIns `
     -Mode Insider
-Write-Host (" - PKeyData Call Api : {0}" -f $Req.IID)
+Write-Host (" - Offline  Call Api : {0}" -f $Req.IID)
 
-$res = Get-PKeyData `
-    -key $Key `
-    -configPath "C:\windows\System32\spp\tokens\pkeyconfig\pkeyconfig.xrm-ms" `
-    -HWID $ShortHWID
-Write-Host (" - PKeyData Call Api : {0}" -f $res[3].Value)
+if ($IsForge) {
+    $Req = Invoke-IIDRequest `
+        -UseApi -ApiMode SLGenerateOfflineInstallationIdEx `
+        -SkuID $SkuID
+    Write-Host (" - PKeyData Call Api : {0}" -f $Req)
+}
+
+if ($IsForge) {
+    $Req = Invoke-IIDRequest `
+        -UseApi -ApiMode GetPKeyData `
+        -Key $Key -configPath $PKeyConfig -HWID $hwid.ShortHWID
+    if ($Req -and $Req[3]) {
+        Write-Host (" - PKeyData Call Api : {0}" -f $Req[3].Value)
+    }
+}
 
 $Result = Get-PidGenXContext -ProductKey $Key -DllPath $pidIns
 if ($Result.Success) {
 
     $Req = Invoke-IIDRequest `
         -RawStruct $Result.RawStruct `
-        -HWID $ShortHWID `
+        -HWID $hwid.ShortHWID `
         -DllPath $pidGen `
         -Mode Retail
     Write-Host (" - PKeyData Call Api : {0}" -f $Req.IID)
