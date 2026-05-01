@@ -3,6 +3,8 @@ using namespace System.Management.Automation
 using namespace System.Runtime.InteropServices
 Import-Module NativeInteropLib -ErrorAction Stop
 
+$IsForge = ([PSTypeName]'LibTSforge.SPP.ProductConfig').Type
+
 $objs   = (Join-Path $PSScriptRoot "SppDll\sppobjs.dll")
 $winob  = (Join-Path $PSScriptRoot "SppDll\sppwinob.dll")
 $pidGen = (Join-Path $PSScriptRoot "SppDll\pidgenx.dll")
@@ -14,8 +16,6 @@ $winob  = if (Test-Path $winob)  { $winob  } else { "sppwinob.dll" }
 $pidGen = if (Test-Path $pidGen) { $pidGen } else { "pidgenx.dll"  }
 $winRT  = if (Test-Path $winRT)  { $winRT  } else { "LicensingWinRT.dll" }
 $pidIns = if (Test-Path $pidIns) { $pidIns } else { Write-Warning "Pidgex Insider Not found .!" }
-
-$IsForge = ([PSTypeName]'LibTSforge.SPP.ProductConfig').Type
 
 # API: LicensingWinRT.dll
 # __int64 __fastcall GetDownlevelPkeyData(unsigned __int8 *a1, __int64 a2, __int64 a3, __int64 a4)
@@ -134,7 +134,7 @@ function Get-ProductHWID {
                     HResult   = "0x00000000"
                     HWIDPtr   = New-IntPtr -Data ($dataBlock.Raw)
                     RawBytes  = $dataBlock.Raw
-                    ShortHWID = $(if ($UseApi) { Convert-HWIDToShort -HWIDStruct $dataBlock.Raw } else { Hwid-ConvertToLargeInt -Raw $dataBlock.Raw })
+                    ShortHWID = $(if ($UseApi) { Convert-HWIDToShort -HWIDBytes $dataBlock.Raw } else { Hwid-ConvertToLargeInt -Raw $dataBlock.Raw })
                 }
             }
             throw "No 'current' license block found in SPP Store."
@@ -170,7 +170,7 @@ function Get-ProductHWID {
                 HResult   = "0x$($hr.ToString('X8'))"
                 HWIDPtr   = $hwidStruct
                 RawBytes  = $byteArray 
-                ShortHWID = $(if ($UseApi) { Convert-HWIDToShort -HWIDStruct $byteArray } else { Hwid-ConvertToLargeInt -Raw $byteArray })
+                ShortHWID = $(if ($UseApi) { Convert-HWIDToShort -HWIDBytes $byteArray } else { Hwid-ConvertToLargeInt -Raw $byteArray })
             }
         }
         else {
@@ -190,10 +190,15 @@ function Get-ProductHWID {
     }
 }
 function Convert-HWIDToShort {
-    [CmdletBinding()]
+    [CmdletBinding(DefaultParameterSetName = 'FromPointer')]
     param (
-        [Parameter(Mandatory = $true)]
+        # Set 1: Provide the existing pointer
+        [Parameter(Mandatory = $true, ParameterSetName = 'FromPointer')]
         [IntPtr]$HWIDStruct,
+
+        # Set 2: Provide bytes, we create/clear the pointer
+        [Parameter(Mandatory = $true, ParameterSetName = 'FromBytes')]
+        [byte[]]$HWIDBytes,
 
         [Parameter(Mandatory = $false)]
         [string]$DllPath = "LicensingWinRT.dll",
@@ -202,15 +207,22 @@ function Convert-HWIDToShort {
         [Int64]$Offset = 0x18002E4C8
     )
 
-    # OUTPUT BUFFER (THIS IS CRITICAL)
     $shortOut = [Marshal]::AllocHGlobal(8)
+    $localAlloc = $false # Track if we allocated the HWID pointer here
 
     try {
         [Marshal]::WriteInt64($shortOut, 0, 0)
 
+        # Logic for Set 2: Convert bytes to a pointer
+        if ($PSCmdlet.ParameterSetName -eq 'FromBytes') {
+            $HWIDStruct = [Marshal]::AllocHGlobal($HWIDBytes.Length)
+            [Marshal]::Copy($HWIDBytes, 0, $HWIDStruct, $HWIDBytes.Length)
+            $localAlloc = $true
+        }
+
         $params = @(
-            $HWIDStruct,   # this
-            $shortOut      # out __int64*
+            $HWIDStruct,
+            $shortOut
         )
 
         $hr = Invoke-UnmanagedMethod `
@@ -220,12 +232,9 @@ function Convert-HWIDToShort {
             -Sub $Offset
 
         if ($hr -ge 0) {
-
-            $value = [Marshal]::ReadInt64($shortOut)
-
             return [PSCustomObject]@{
                 Success   = $true
-                ShortHWID = $value
+                ShortHWID = [Marshal]::ReadInt64($shortOut)
                 HResult   = "0x$($hr.ToString('X8'))"
             }
         }
@@ -236,7 +245,15 @@ function Convert-HWIDToShort {
         }
     }
     finally {
-        [Marshal]::FreeHGlobal($shortOut)
+        # Clean up the output buffer
+        if ($shortOut -ne [IntPtr]::Zero) { 
+            [Marshal]::FreeHGlobal($shortOut) 
+        }
+
+        # Clean up the HWID pointer ONLY if we created it in this function
+        if ($localAlloc -and $HWIDStruct -ne [IntPtr]::Zero) {
+            [Marshal]::FreeHGlobal($HWIDStruct)
+        }
     }
 }
 
@@ -729,6 +746,7 @@ function Invoke-IIDRequest {
                         [marshal]::PtrToStringAuto($ppwszInstallationIdPtr)
                     )
                 }
+
         } elseif ($ApiMode -eq 'GetPKeyData') {
 
             $Pattern = '^[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}$'
