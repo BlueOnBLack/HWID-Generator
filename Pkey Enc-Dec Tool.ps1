@@ -5,11 +5,11 @@ Import-Module NativeInteropLib -ErrorAction Stop
 
 $IsForge = ([PSTypeName]'LibTSforge.SPP.ProductConfig').Type
 
-$objs   = (Join-Path $PSScriptRoot "SppDll\sppobjs.dll")
-$winob  = (Join-Path $PSScriptRoot "SppDll\sppwinob.dll")
-$pidGen = (Join-Path $PSScriptRoot "SppDll\pidgenx.dll")
-$winRT  = (Join-Path $PSScriptRoot "SppDll\LicensingWinRT.dll")
-$pidIns = (Join-Path $PSScriptRoot "SppDll\pidgenxInsider.dll")
+$objs   = (Join-Path $PSScriptRoot "sppobjs.dll")
+$winob  = (Join-Path $PSScriptRoot "sppwinob.dll")
+$pidGen = (Join-Path $PSScriptRoot "pidgenx.dll")
+$winRT  = (Join-Path $PSScriptRoot "LicensingWinRT.dll")
+$pidIns = (Join-Path $PSScriptRoot "pidgenxIn.dll")
 
 $objs   = if (Test-Path $objs)   { $objs   } else { "sppobjs.dll"  }
 $winob  = if (Test-Path $winob)  { $winob  } else { "sppwinob.dll" }
@@ -28,19 +28,95 @@ $pidIns = if (Test-Path $pidIns) { $pidIns } else { Write-Warning "Pidgex Inside
 function Get-ProductHWID {
     [CmdletBinding(DefaultParameterSetName = 'Manual')]
     param (
-        [Parameter(Mandatory = $true, ParameterSetName = 'Manual')]
-        [string]$CdKey,
-
         [Parameter(Mandatory = $true, ParameterSetName = 'Store')]
         [switch]$FromStore,
 
         [Parameter(Mandatory = $false)]
         [string]$DllPath = "LicensingWinRT.dll",
 
-        [Parameter(Mandatory = $false)]
-        [Int64]$Offset = 0x18002DD10,
-
         [switch]$UseApi
+    )
+
+    $WinrtDll = $DllPath
+    if (-not [System.IO.Path]::IsPathRooted($WinrtDll)) {
+        $WinrtDll = Join-Path $env:windir "System32\LicensingWinRT.dll"
+    }
+    $Offset = Get-HwidRVA -dllpath $WinrtDll
+    
+    try {
+        # --- Parameter Set: Store ---
+        if ($PSCmdlet.ParameterSetName -eq 'Store') {
+            if(!([PSTypeName]'LibTSforge.SPP.ProductConfig').Type) {
+                Write-Warning "Missing nececery libraries !"
+                Write-Warning "Please load first PkeyConsole"
+                return
+            }
+            $dataBlock = Get-SppStoreLicense -SkuType Windows -IgnoreEsu -Dump | 
+                            Where-Object Value -match 'current' | 
+                            Select-Object -First 1
+
+            if ($dataBlock) {
+                # Assuming .Data contains the 0x118 buffer
+                return [PSCustomObject]@{
+                    Success   = $true
+                    Source    = "SPP Store"
+                    HResult   = "0x00000000"
+                    HWIDPtr   = New-IntPtr -Data ($dataBlock.Raw)
+                    RawBytes  = $dataBlock.Raw
+                    ShortHWID = $(if ($UseApi) { Convert-HWIDToShort -HWIDBytes $dataBlock.Raw } else { Convert-HWIDToShort -HWIDBytes $dataBlock.Raw -Modern })
+                }
+            }
+            throw "No 'current' license block found in SPP Store."
+        }
+
+        # --- Parameter Set: Manual (DLL Invoke) ---
+        $_HWID = [IntPtr]::Zero
+        $params = 0L, 0x0, [ref]$_HWID, [ref]0L, [ref]0L, [ref]0L
+        $hr = Invoke-UnmanagedMethod -Dll $DllPath -Function "Inner" -Values $params -Sub $Offset
+
+        if ($hr -ge 0 -and $_HWID -ne [IntPtr]::Zero) {
+            $byteArray = New-Object Byte[] 0x118
+            [Marshal]::Copy($_HWID, $byteArray, 0, 0x118)
+            $ShortHWID = $(if ($UseApi) { Convert-HWIDToShort -HWIDBytes $byteArray } else { Convert-HWIDToShort -HWIDBytes $byteArray -Modern })
+            return [PSCustomObject]@{
+                Success   = $true
+                Source    = "DLL Invoke"
+                HResult   = "0x$($hr.ToString('X8'))"
+                HWIDPtr   = $_HWID
+                RawBytes  = $byteArray 
+                ShortHWID = $ShortHWID
+            }
+        }
+        else {
+            return [PSCustomObject]@{
+                Success = $false
+                HResult = "0x$($hr.ToString('X8'))"
+                Error   = "HWID Extract failed via DLL."
+            }
+        }
+    }
+    catch {
+        Write-Error $_.Exception.Message
+    }
+    finally {
+        # Clean up CdKey pointer if it was created
+        if ($cdKeyBytes) { Free-IntPtr $cdKeyBytes }
+    }
+}
+function Convert-HWIDToShort {
+    [CmdletBinding(DefaultParameterSetName = 'FromPointer')]
+    param (
+        [Parameter(Mandatory = $true, ParameterSetName = 'FromPointer')]
+        [IntPtr]$HWIDStruct,
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'FromBytes')]
+        [byte[]]$HWIDBytes,
+
+        [Parameter(Mandatory = $false)]
+        [string]$DllPath = "LicensingWinRT.dll",
+
+        [Parameter(Mandatory = $false, ParameterSetName = 'FromBytes')]
+        [Switch]$Modern
     )
 
     function Hwid-ConvertToLargeInt {
@@ -113,118 +189,30 @@ function Get-ProductHWID {
         $final = ([int64]$S.H -shl 32) -bor ([uint32]$S.L)
         return $final
     }
-    
-    try {
-        # --- Parameter Set: Store ---
-        if ($PSCmdlet.ParameterSetName -eq 'Store') {
-            if(!([PSTypeName]'LibTSforge.SPP.ProductConfig').Type) {
-                Write-Warning "Missing nececery libraries !"
-                Write-Warning "Please load first PkeyConsole"
-                return
-            }
-            $dataBlock = Get-SppStoreLicense -SkuType Windows -IgnoreEsu -Dump | 
-                            Where-Object Value -match 'current' | 
-                            Select-Object -First 1
 
-            if ($dataBlock) {
-                # Assuming .Data contains the 0x118 buffer
-                return [PSCustomObject]@{
-                    Success   = $true
-                    Source    = "SPP Store"
-                    HResult   = "0x00000000"
-                    HWIDPtr   = New-IntPtr -Data ($dataBlock.Raw)
-                    RawBytes  = $dataBlock.Raw
-                    ShortHWID = $(if ($UseApi) { Convert-HWIDToShort -HWIDBytes $dataBlock.Raw } else { Hwid-ConvertToLargeInt -Raw $dataBlock.Raw })
-                }
-            }
-            throw "No 'current' license block found in SPP Store."
-        }
-
-        # --- Parameter Set: Manual (DLL Invoke) ---
-        $Enc        = Get-PidGenEncoder -ProductKey $Key -Modern
-        $cdKeyBytes = New-IntPtr -Data $Enc.BinaryKey
-        $hwidStruct = [IntPtr]::Zero
-        $shortHwid  = [UInt32]0
-        $a5 = [IntPtr]::Zero
-        $a6 = [Uint64]0L
-
-        $params = @(
-            $cdKeyBytes,      # a1
-            0,                # a2
-            [ref]$hwidStruct, # a3
-            [ref]$shortHwid,  # a4
-            $a5,              # a5
-            $a6               # a6
-        )
-
-        $hr = Invoke-UnmanagedMethod -Dll $DllPath -Function "Inner" -Values $params -Sub $Offset
-
-        if ($hr -ge 0 -and $hwidStruct -ne [IntPtr]::Zero) {
-            $structSize = 0x118 
-            $byteArray = New-Object Byte[] $structSize
-            [Marshal]::Copy($hwidStruct, $byteArray, 0, $structSize)
-
-            return [PSCustomObject]@{
-                Success   = $true
-                Source    = "DLL Invoke"
-                HResult   = "0x$($hr.ToString('X8'))"
-                HWIDPtr   = $hwidStruct
-                RawBytes  = $byteArray 
-                ShortHWID = $(if ($UseApi) { Convert-HWIDToShort -HWIDBytes $byteArray } else { Hwid-ConvertToLargeInt -Raw $byteArray })
-            }
-        }
-        else {
-            return [PSCustomObject]@{
-                Success = $false
-                HResult = "0x$($hr.ToString('X8'))"
-                Error   = "HWID Extract failed via DLL."
-            }
-        }
+    $WinrtDll = $DllPath
+    if (-not [System.IO.Path]::IsPathRooted($WinrtDll)) {
+        $WinrtDll = Join-Path $env:windir "System32\LicensingWinRT.dll"
     }
-    catch {
-        Write-Error $_.Exception.Message
-    }
-    finally {
-        # Clean up CdKey pointer if it was created
-        if ($cdKeyBytes) { Free-IntPtr $cdKeyBytes }
-    }
-}
-function Convert-HWIDToShort {
-    [CmdletBinding(DefaultParameterSetName = 'FromPointer')]
-    param (
-        # Set 1: Provide the existing pointer
-        [Parameter(Mandatory = $true, ParameterSetName = 'FromPointer')]
-        [IntPtr]$HWIDStruct,
-
-        # Set 2: Provide bytes, we create/clear the pointer
-        [Parameter(Mandatory = $true, ParameterSetName = 'FromBytes')]
-        [byte[]]$HWIDBytes,
-
-        [Parameter(Mandatory = $false)]
-        [string]$DllPath = "LicensingWinRT.dll",
-
-        [Parameter(Mandatory = $false)]
-        [Int64]$Offset = 0x18002E4C8
-    )
 
     $shortOut = [Marshal]::AllocHGlobal(8)
-    $localAlloc = $false # Track if we allocated the HWID pointer here
+    $localAlloc = $false
 
     try {
         [Marshal]::WriteInt64($shortOut, 0, 0)
 
-        # Logic for Set 2: Convert bytes to a pointer
         if ($PSCmdlet.ParameterSetName -eq 'FromBytes') {
+            if ($Modern.IsPresent) {
+                return Hwid-ConvertToLargeInt -Raw $HWIDBytes
+            }
+
             $HWIDStruct = [Marshal]::AllocHGlobal($HWIDBytes.Length)
             [Marshal]::Copy($HWIDBytes, 0, $HWIDStruct, $HWIDBytes.Length)
             $localAlloc = $true
         }
 
-        $params = @(
-            $HWIDStruct,
-            $shortOut
-        )
-
+        $params = $HWIDStruct, $shortOut
+        $Offset = Get-ShortHwidRVA -dllpath $WinrtDll
         $hr = Invoke-UnmanagedMethod `
             -Dll $DllPath `
             -Function "ConvertToShort" `
@@ -232,16 +220,9 @@ function Convert-HWIDToShort {
             -Sub $Offset
 
         if ($hr -ge 0) {
-            return [PSCustomObject]@{
-                Success   = $true
-                ShortHWID = [Marshal]::ReadInt64($shortOut)
-                HResult   = "0x$($hr.ToString('X8'))"
-            }
-        }
-
-        return [PSCustomObject]@{
-            Success = $false
-            HResult = "0x$($hr.ToString('X8'))"
+            return (
+                [Marshal]::ReadInt64($shortOut)
+            )
         }
     }
     finally {
@@ -258,7 +239,6 @@ function Convert-HWIDToShort {
 }
 
 # API: sppwinob.dll
-# API: pidgenx.dll / sppobjs.dll
 function Get-PidGenDecoder {
     [CmdletBinding()]
     param (
@@ -268,6 +248,12 @@ function Get-PidGenDecoder {
         [Parameter(Mandatory = $false)]
         [string]$DllPath = "sppwinob.dll"
     )
+
+    $WinobDll = $DllPath
+    if (-not [System.IO.Path]::IsPathRooted($WinobDll)) {
+        $WinrtDll = Join-Path $env:windir "System32\sppwinob.dll"
+    }
+    $Offset = Get-DecodeRVA -dllpath $WinobDll
 
     if ($BinaryKey.Length -ne 16) {
         Write-Error "BinaryKey must be exactly 16 bytes (128-bit)."
@@ -285,7 +271,7 @@ function Get-PidGenDecoder {
         $params = $binKeyPtr, 0L, [ref]$decodedKeyPtr
         $hr = Invoke-UnmanagedMethod `
             -Dll $DllPath `
-            -Function "sub_18004046C" `
+            -Function "Inner" `
             -Values $params `
             -Sub 0x18004046C
 
@@ -308,6 +294,7 @@ function Get-PidGenDecoder {
         [Marshal]::FreeHGlobal($outStrPtr)
     }
 }
+# API: pidgenx.dll / sppobjs.dll
 function Get-PidGenEncoder {
     [CmdletBinding(DefaultParameterSetName = 'Modern')]
     param (
@@ -403,16 +390,21 @@ function Get-PidGenEncoder {
     try {
         [Marshal]::WriteInt64($binKeyPtr, 0, 0L)
         [Marshal]::WriteInt64($binKeyPtr, 8, 0L)
-        [Marshal]::WriteInt32($flagPtr, 0, 0)
-
-        # Set address based on the DLL chosen
-        if ($DllName -eq "pidgenx.dll") {
-            $subAddress = 0x180020C5C
-        } elseif ($DllName -eq "sppobjs.dll") {
-            $subAddress = 0x18013C8DC
-        }
+        [Marshal]::WriteInt32($flagPtr,   0, 0)
         
         $hr = -1
+ 
+        try {
+            $DllPath = if ([string]::IsNullOrEmpty($CustomPath)) { $DllName } else { $CustomPath }
+            if (-not [System.IO.Path]::IsPathRooted($DllName)) {
+                $DllPath = "$env:windir\System32\$DllName"
+            }
+            $Offset = Get-EncodeRVA -dllpath $DllPath
+        }
+        catch {
+            Write-Host $_
+        }
+
         if ($Direct.IsPresent) {
             $hr = 0
             $binBytes = EncodeKey -ProductKey $Key
@@ -422,7 +414,7 @@ function Get-PidGenEncoder {
                 -Dll $DllPath `
                 -Function "Decode" `
                 -Values @($ProductKey, $binKeyPtr, [uint32]0x10, $flagPtr) `
-                -Sub $subAddress
+                -Sub $Offset
             if ($hr -ge 0) {
                 $binBytes = New-Object byte[] 0x10
                 [Marshal]::Copy($binKeyPtr, $binBytes, 0, 0x10)
@@ -468,16 +460,36 @@ function Get-PidGenXContext {
     try {
         # Initialize Context memory to zero
         for ($i = 0; $i -lt $contextSize; $i += 8) { [Marshal]::WriteInt64($rawPtr, $i, 0L) }
+        $DllName = $DllPath
+        if (-not [System.IO.Path]::IsPathRooted($DllName)) {
+            $DllName = "$env:windir\System32\$DllName"
+        }
 
         if ($PSCmdlet.ParameterSetName -eq "String") {
             # MODE: High-Level Wrapper (Insider Style)
-            $hr = Invoke-UnmanagedMethod -Dll $DllPath -Function "sub_1800090B0" -Values @($ProductKey, $rawPtr, 0L) -Sub 0x1800090B0
+            $offset = 0L
+            try {
+                $offset = Get-ContextRVA -dllpath $DllName
+            } catch {}
+            if ($offset -lt 0L) {
+                throw "Get-ContextRVA: can't find offset"
+            }
+            $hr = Invoke-UnmanagedMethod -Dll $DllPath -Function "Inner" -Values @($ProductKey, $rawPtr, 0L) -Sub 0x1800090B0
         } else {
             # MODE: Low-Level Bit-Parser (Retail Style)
             $pKeyPtr = [Marshal]::AllocHGlobal(0x10)
             [Marshal]::Copy($BinaryKey, 0, $pKeyPtr, 0x10)
             $flag = $false
-            $hr = Invoke-UnmanagedMethod -Dll $DllPath -Function "sub_180020A1C" -Values @($pKeyPtr, $rawPtr, [ref]$flag) -Sub 0x180020A1C
+            
+            $offset = 0L
+            try {
+                $offset = Get-XMMDecoderRVA -dllpath $DllName
+            } catch {}
+            if ($offset -lt 0L) {
+                throw "Get-ContextRVA: can't find offset"
+            }
+            
+            $hr = Invoke-UnmanagedMethod -Dll $DllPath -Function "Inner" -Values @($pKeyPtr, $rawPtr, [ref]$flag) -Sub $offset
         }
 
         if ($hr -eq 0) {
@@ -667,9 +679,34 @@ function Invoke-IIDRequest {
     } PID_OBJ;
     #>
 
+    try {
+        $Module = [AppDomain]::CurrentDomain.GetAssemblies() | ? { $_.ManifestModule.ScopeName -eq "OFF" } | select -Last 1
+        $Global:OFF = $Module.GetTypes()[0]
+    }
+    catch {
+        $Module = [AppDomain]::CurrentDomain.DefineDynamicAssembly("null", 1).DefineDynamicModule("OFF", $False).DefineType("null")
+        @(
+            @('null', 'null', [int], @()), # place holder
+            @('SLOpen',                             'sppc.dll', [Int32], @([IntPtr].MakeByRefType())),
+            @('SLClose',                            'sppc.dll', [Int32], @([IntPtr])),
+            @('SLGenerateOfflineInstallationIdEx',  'sppc.dll', [Int32], @([IntPtr], [Guid].MakeByRefType(), [Int32], [IntPtr].MakeByRefType())),
+            @('SLDepositOfflineConfirmationId',     'sppc.dll', [Int32], @([IntPtr], [Guid].MakeByRefType(), [IntPtr], [IntPtr]))
+
+        ) | % {
+            $Module.DefinePInvokeMethod(($_[0]), ($_[1]), 22, 1, [Type]($_[2]), [Type[]]($_[3]), 1, 3).SetImplementationFlags(128)
+        }
+        $Global:OFF = $Module.CreateType()
+    }
+
     $bufSize = 0x58
     $buffer = New-Object byte[] $bufSize
     [Array]::Clear($buffer, 0, $buffer.Length)
+
+    $PidDll = $DllPath
+    if (-not [System.IO.Path]::IsPathRooted($PidDll)) {
+        $PidDll = Join-Path $env:windir "System32\pidgenx.dll"
+    }
+    [Int64]$offset = Get-PidGenRVA -dllpath $PidDll
 
     $param = $PSCmdlet.ParameterSetName
     if ($param -match "FromStruct|FromForge") {
@@ -705,7 +742,6 @@ function Invoke-IIDRequest {
             $pOutString = ''
             $signatureBase = [IntPtr]::Add($hBuffer, 0x8)
             $params = $signatureBase, 0L, [int64]$HWID, [int64]0L, [ref]$pOutString
-            [Int64]$offset = if($Mode -eq "Insider") { 0x180006A94 } else { 0x18001D8B8 }
             $hr = Invoke-UnmanagedMethod `
                 -Dll $DllPath `
                 -Function "InnerCall" `
@@ -727,27 +763,30 @@ function Invoke-IIDRequest {
 
     } elseif ($param -match 'FromAPI') {
 
+        if ($ApiMode -eq 'SLGenerateOfflineInstallationIdEx' -and (
+            $SkuID -and $SkuID -ne [Guid]::Empty)) {
+            $hSLC = 0L
+            $Global:OFF::SLOpen([ref]$hSLC) | Out-Null
+            $ppwszInstallation = $null
+            $ppwszInstallationIdPtr = [IntPtr]::Zero
+            $pProductSkuId = [Guid]$SkuID
+            $null = $Global:OFF::SLGenerateOfflineInstallationIdEx(
+                $hSLC, [ref]$pProductSkuId, 0, [ref]$ppwszInstallationIdPtr)
+            if ($ppwszInstallationIdPtr -ne [IntPtr]::Zero) {
+                return (
+                    [marshal]::PtrToStringAuto($ppwszInstallationIdPtr)
+                )
+            }
+            $Global:OFF::SLClose($hSLC) | Out-Null
+        }
+
         if(!([PSTypeName]'LibTSforge.SPP.ProductConfig').Type) {
             Write-Warning "Missing nececery libraries !"
             Write-Warning "Please load first PkeyConsole"
             return
         }
 
-        if ($ApiMode -eq 'SLGenerateOfflineInstallationIdEx' -and (
-            $SkuID -and $SkuID -ne [Guid]::Empty)) {
-                $hSLC = Manage-SLHandle
-                $ppwszInstallation = $null
-                $ppwszInstallationIdPtr = [IntPtr]::Zero
-                $pProductSkuId = [Guid]$SkuID
-                $null = $Global:SLC::SLGenerateOfflineInstallationIdEx(
-                    $hSLC, [ref]$pProductSkuId, 0, [ref]$ppwszInstallationIdPtr)
-                if ($ppwszInstallationIdPtr -ne [IntPtr]::Zero) {
-                    return (
-                        [marshal]::PtrToStringAuto($ppwszInstallationIdPtr)
-                    )
-                }
-
-        } elseif ($ApiMode -eq 'GetPKeyData') {
+        if ($ApiMode -eq 'GetPKeyData') {
 
             $Pattern = '^[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}$'
             if ([String]::IsNullOrEmpty($Key) -or $Key.ToUpper() -notmatch $Pattern) {
@@ -765,6 +804,355 @@ function Invoke-IIDRequest {
     }
 }
 
+#RVA HElpers
+function Get-VAFromOffset {
+    param (
+        [byte[]]$Bytes,
+        [long]$FileOffset,
+        [long]$ImageBase = 0x180000000
+    )
+
+    # 1. Locate PE Header
+    $pePos = [BitConverter]::ToUInt32($Bytes, 0x3C)
+    
+    # 2. Extract Section Metadata
+    $nSections = [BitConverter]::ToUInt16($Bytes, $pePos + 0x06)
+    $optHeaderSize = [BitConverter]::ToUInt16($Bytes, $pePos + 0x14)
+    $sectionTable = $pePos + 0x18 + $optHeaderSize
+
+    # 3. Iterate Sections to find where the FileOffset lives
+    for ($i = 0; $i -lt $nSections; $i++) {
+        $ptr = $sectionTable + ($i * 40)
+        
+        $rawPtr  = [BitConverter]::ToUInt32($Bytes, $ptr + 0x14)
+        $rawSize = [BitConverter]::ToUInt32($Bytes, $ptr + 0x10)
+        $virtAddr = [BitConverter]::ToUInt32($Bytes, $ptr + 0x0C)
+
+        # Check if the offset falls within this section's raw data
+        if ($FileOffset -ge $rawPtr -and $FileOffset -lt ($rawPtr + $rawSize)) {
+            $rva = ($FileOffset - $rawPtr) + $virtAddr
+            return [Int64]($ImageBase + $rva)
+        }
+    }
+    return $null
+}
+function Get-ShortHwidRVA {
+    param (
+        [string]$dllpath = "$env:windir\system32\LicensingWinRT.dll",
+        # Fix: 1C000000h in Little-Endian is 00 00 00 1C
+        $pattern = [byte[]](0x00, 0x00, 0x00, 0x1C)
+    )
+
+    if (-not (Test-Path $dllpath)) { return $null }
+    $dllBytes = [System.IO.File]::ReadAllBytes($dllpath)
+    $constantOffset = -1
+
+    # 1. Look for the mask 1C000000h
+    for ($i = 0; $i -lt ($dllBytes.Length - 4); $i++) {
+        if ($dllBytes[$i] -eq $pattern[0] -and $dllBytes[$i+1] -eq $pattern[1] -and $dllBytes[$i+2] -eq $pattern[2] -and $dllBytes[$i+3] -eq $pattern[3]) {
+            
+            # Check for common mask instructions: 
+            # 25 (AND EAX, imm32) or 81 /4 (AND rm32, imm32)
+            $isAndImm = ($dllBytes[$i-1] -eq 0x25)
+            $isAndReg = ($dllBytes[$i-2] -eq 0x81 -and ($dllBytes[$i-1] -ge 0xE0 -and $dllBytes[$i-1] -le 0xE7))
+            $isMovReg = ($dllBytes[$i-1] -eq 0xB8 -or $dllBytes[$i-1] -eq 0xBA) # mov eax/edx, imm32
+
+            if ($isAndImm -or $isAndReg -or $isMovReg) {
+                $constantOffset = $i
+                break
+            }
+        }
+    }
+
+    if ($constantOffset -eq -1) { return $null }
+
+    # 2. Look back for the TRUE Function Start (Prologue)
+    # ConvertToShort is long, so we scan back further (0x800)
+    $funcStartOffset = -1
+    $searchLimit = [Math]::Max(0, $constantOffset - 0x800)
+
+    for ($i = $constantOffset; $i -gt $searchLimit; $i--) {
+        # Check for standard x64 prologues
+        if (($dllBytes[$i] -eq 0x48 -and $dllBytes[$i+1] -eq 0x89 -and $dllBytes[$i+2] -eq 0x5C) -or  # mov [rsp+8], rbx
+            ($dllBytes[$i] -eq 0x48 -and $dllBytes[$i+1] -eq 0x83 -and $dllBytes[$i+2] -eq 0xEC) -or  # sub rsp, XX
+            ($dllBytes[$i] -eq 0x48 -and $dllBytes[$i+1] -eq 0x8B -and $dllBytes[$i+2] -eq 0xC4) -or  # mov rax, rsp
+            ($dllBytes[$i] -eq 0x40 -and $dllBytes[$i+1] -eq 0x53)) {                                 # push rbx
+            
+            # Alignment validation
+            if ($dllBytes[$i-1] -eq 0xCC -or $dllBytes[$i-1] -eq 0x90 -or $dllBytes[$i-1] -eq 0xC3) {
+                $funcStartOffset = $i
+                break
+            }
+        }
+    }
+
+    if ($funcStartOffset -eq -1) { return $null }
+    return Get-VAFromOffset $dllBytes $funcStartOffset
+}
+function Get-HwidRVA {
+    param (
+        [string]$dllpath = "$env:windir\system32\LicensingWinRT.dll",
+        $pattern = [byte[]](0x18, 0x01, 0x00, 0x00)
+    )
+
+    if (-not (Test-Path $dllpath)) { return $null }
+    $dllBytes = [System.IO.File]::ReadAllBytes($dllpath)
+
+    # --- STAGE 1: FIRST CMP FIND ---
+    $firstCmpOffset = -1
+    for ($i = 3; $i -lt ($dllBytes.Length - 4); $i++) {  # Start at index 3 to safely access -1, -2, and -3 offsets
+        if ($dllBytes[$i] -eq $pattern[0] -and $dllBytes[$i+1] -eq $pattern[1] -and $dllBytes[$i+2] -eq $pattern[2]) {
+            $isEaxCmp      = ($dllBytes[$i-1] -eq 0x3D)
+            $isStandardCmp = ($dllBytes[$i-2] -eq 0x81 -and $dllBytes[$i-1] -ge 0xF8 -and $dllBytes[$i-1] -le 0xFB)
+            $isRexCmp      = ($dllBytes[$i-3] -eq 0x41 -and $dllBytes[$i-2] -eq 0x81 -and $dllBytes[$i-1] -ge 0xF8 -and $dllBytes[$i-1] -le 0xFB)
+
+            if ($isEaxCmp -or $isStandardCmp -or $isRexCmp) {
+                $firstCmpOffset = $i
+                break
+            }
+        }
+    }
+    if ($firstCmpOffset -eq -1) { return "Fail: CMP 0x118 not found" }
+
+    # --- STAGE 2: SECOND 0x118 FIND (Alloc Size) ---
+    $allocConstantOffset = -1
+    for ($j = ($firstCmpOffset - 1); $j -gt 0; $j--) {  # Search backward from firstCmpOffset
+        if ($dllBytes[$j] -eq $pattern[0] -and $dllBytes[$j+1] -eq $pattern[1] -and $dllBytes[$j+2] -eq $pattern[2]) {
+            $allocConstantOffset = $j
+            break
+        }
+    }
+    if ($allocConstantOffset -eq -1) { return "Fail: Second 0x118 not found before CMP" }
+
+    # --- UNIVERSAL STAGE 3: Multi-Prologue Precision Scan ---
+    $funcStartOffset = -1
+    # 0x150 (336 bytes) is the "sweet spot" for distance from the 118h constant
+    $searchLimit = [Math]::Max(0, $allocConstantOffset - 0x150)
+
+    for ($k = $allocConstantOffset; $k -gt $searchLimit; $k--) {
+        # Signature A: IDA "Hot-Patch" (mov rax, rsp) -> 48 8B C4
+        $isHotPatch = ($dllBytes[$k] -eq 0x48 -and $dllBytes[$k+1] -eq 0x8B -and $dllBytes[$k+2] -eq 0xC4)
+
+        # Signature B: Standard Stack Alloc (sub rsp, XX) -> 48 83 EC
+        $isSubRsp   = ($dllBytes[$k] -eq 0x48 -and $dllBytes[$k+1] -eq 0x83 -and $dllBytes[$k+2] -eq 0xEC)
+
+        # Signature C: Standard Frame Pointer (push rbp; mov rbp, rsp) -> 55 48 89 E5 (or just 55)
+        $isPushRbp  = ($dllBytes[$k] -eq 0x55 -and $dllBytes[$k+1] -eq 0x48 -and $dllBytes[$k+2] -eq 0x89)
+
+        if ($isHotPatch -or $isSubRsp -or $isPushRbp) {
+            # --- UNIVERSAL VALIDATION ---
+            # Every true function start must be preceded by alignment/padding:
+            # CC (int3), 90 (nop), or C3 (previous function's return)
+            $prev = $dllBytes[$k-1]
+            if ($prev -eq 0xCC -or $prev -eq 0x90 -or $prev -eq 0xC3) {
+                $funcStartOffset = $k
+                break
+            }
+        }
+    }
+
+    return Get-VAFromOffset $dllBytes $funcStartOffset
+}
+function Get-PidGenRVA {
+    param (
+        [string]$dllpath = "$env:windir\system32\pidgenx.dll",
+
+        # B8731595h, 0xB8731595, -1200417387, 
+        $pattern = [byte[]](0x95, 0x15, 0x73, 0xB8)
+    )
+
+    $dllBytes = [System.IO.File]::ReadAllBytes($dllpath)
+    $constantOffset = -1
+
+    for ($i = 0; $i -lt ($dllBytes.Length - 4); $i++) {
+        if ($dllBytes[$i] -eq $pattern[0] -and $dllBytes[$i+1] -eq $pattern[1] -and $dllBytes[$i+2] -eq $pattern[2] -and $dllBytes[$i+3] -eq $pattern[3]) {
+            $isStandardCmp = ($dllBytes[$i-2] -eq 0x81 -and $dllBytes[$i-1] -ge 0xF8 -and $dllBytes[$i-1] -le 0xFB)
+            $isEaxCmp      = ($dllBytes[$i-1] -eq 0x3D)
+            $isRexCmp      = ($dllBytes[$i-3] -eq 0x41 -and $dllBytes[$i-2] -eq 0x81 -and $dllBytes[$i-1] -ge 0xF8 -and $dllBytes[$i-1] -le 0xFB)
+            if ($isStandardCmp -or $isEaxCmp -or $isRexCmp) {
+                $constantOffset = $i
+                break
+            }
+        }
+    }
+
+    if ($constantOffset -eq -1) { return $null }
+
+    # 2. Look back for the TRUE Function Start (Prologue)
+    $funcStartOffset = -1
+    for ($i = $constantOffset; $i -gt 0; $i--) {
+        if (($dllBytes[$i] -eq 0x48 -and $dllBytes[$i+1] -eq 0x89 -and $dllBytes[$i+2] -eq 0x5C) -or 
+            ($dllBytes[$i] -eq 0x48 -and $dllBytes[$i+1] -eq 0x83 -and $dllBytes[$i+2] -eq 0xEC) -or
+            ($dllBytes[$i] -eq 0x40 -and $dllBytes[$i+1] -eq 0x53)) {
+            
+            if ($dllBytes[$i-1] -eq 0xCC -or $dllBytes[$i-1] -eq 0x90 -or $dllBytes[$i-1] -eq 0xC3) {
+                $funcStartOffset = $i
+                break
+            }
+        }
+    }
+
+    if ($funcStartOffset -eq -1) { return $null }
+    return Get-VAFromOffset $dllBytes $funcStartOffset
+}
+function Get-DecodeRVA {
+    param (
+        [string]$dllpath = "$env:windir\system32\sppwinob.dll"
+    )
+
+    if (-not (Test-Path $dllpath)) { return "File not found." }
+
+    # Read all bytes in the DLL
+    $b = [System.IO.File]::ReadAllBytes($dllpath)
+    $len = $b.Length
+
+    # 1. Main Loop: Optimized Pattern Scan for 'N' Assignment
+    for ($i = 0; $i -lt ($len - 10); $i++) {
+        
+        # Fast Gate: Only check for patterns if it's either 0x41 or 0xB8
+        if ($b[$i] -eq 0x41) {
+            # Check the sequence (0xBB 0x4E) at $i+1, $i+2 for 'mov r11d, 4Eh'
+            if ($b[$i+1] -eq 0xBB -and $b[$i+2] -eq 0x4E) {
+                $patternMatched = $true
+            }
+            else {
+                continue
+            }
+        } elseif ($b[$i] -eq 0xB8) {
+            # Check the sequence (0x4E 0x00) at $i+1, $i+2
+            if ($b[$i+1] -eq 0x4E -and $b[$i+2] -eq 0x00) {
+                $patternMatched = $true
+            }
+            else {
+                continue
+            }
+        } else {
+            continue
+        }
+
+        # 2. Find Function Start (backwalk) if Pattern Matched
+        if ($patternMatched) {
+            $fStart = -1
+            $minJ = [Math]::Max(1, $i - 1024)
+            for ($j = $i; $j -ge $minJ; $j--) {
+                # Check for prologue: sub rsp or mov [rsp]
+                if (($b[$j] -eq 0x48) -and (($b[$j+1] -eq 0x83 -and $b[$j+2] -eq 0xEC) -or ($b[$j+1] -eq 0x89 -and $b[$j+2] -eq 0x5C))) {
+                    # Verify padding or RET boundary (0xCC, 0x90, 0xC3)
+                    if ($b[$j-1] -in 0xCC, 0x90, 0xC3) {
+                        $fStart = $j
+                        break
+                    }
+                }
+            }
+
+            if ($fStart -ne -1) {
+                return Get-VAFromOffset $b $fStart
+            }
+        }
+    }
+    return "Target logic not found."
+}
+function Get-EncodeRVA {
+    param (
+        [string]$dllpath
+    )
+
+    if (-not (Test-Path $dllpath)) { return "File not found." }
+    $b = [System.IO.File]::ReadAllBytes($dllpath)
+
+    # Instruction pattern: cmp [reg], 19h
+    $anchorOffset = -1
+    for ($i = 0; $i -lt ($b.Length - 3); $i++) {
+        if ($b[$i] -eq 0x83) {
+            if ($b[$i+2] -eq 0x19 -and $b[$i-1] -eq 0x41) {
+                $anchorOffset = $i - 170
+                $fStart = -1
+                for ($k = $anchorOffset; $k -ge ($anchorOffset - 140); $k--) {
+                    if ($b[$k] -match "83|85" -and $b[$k-1] -match "83|85") {
+                        $fStart = $k-2
+                    }
+                }
+                if ($fStart -ne -1) {
+                    break 
+                }
+            }
+        }
+    }
+
+    if ($fStart -eq -1) { return "Could not locate prologue." }
+    return Get-VAFromOffset $b $fStart
+}
+function Get-XMMDecoderRVA {
+    param (
+        [string]$dllpath = 'C:\Windows\System32\pidgenx.dll'
+    )
+
+    if (-not (Test-Path $dllpath)) { return 0 }
+    $b = [System.IO.File]::ReadAllBytes($dllpath)
+
+    $fStart = -1
+    # 1. Primary Anchor: and ebx, 3FFh (81 E3 FF 03 00 00)
+    for ($i = 0; $i -lt ($b.Length - 6); $i++) {
+        if ($b[$i] -eq 0x81 -and $b[$i+1] -eq 0xE3 -and $b[$i+2] -eq 0xFF -and $b[$i+3] -eq 0x03) {
+            
+            # 2. Precise Backtrack
+            # Since the mask is at +0x128 (296 decimal), we jump back 300 
+            # to land just slightly before the function start.
+            $anchorOffset = $i - 300 
+
+            for ($k = $anchorOffset; $k -le ($anchorOffset + 100); $k++) {
+                # Look for the 'mov [rsp+...], rbx' (48 89 5C 24) landmark
+                if ($b[$k] -eq 0x48 -and $b[$k+1] -eq 0x89 -and $b[$k+2] -eq 0x5C) {
+                    $fStart = $k
+                    break
+                }
+            }
+        }
+        if ($fStart -ne -1) { break }
+    }
+
+    if ($fStart -eq -1) { return 0 }
+    return (Get-VAFromOffset $b $fStart)
+}
+function Get-ContextRVA {
+    param (
+        [string]$dllpath = 'C:\Windows\System32\pidgenx.dll'
+    )
+
+    if (-not (Test-Path $dllpath)) { return 0 }
+    $b = [System.IO.File]::ReadAllBytes($dllpath)
+
+    $fStart = -1
+
+    # Search for the constant 0xF4240 (40 42 0F 00)
+    for ($i = 0; $i -lt ($b.Length - 4); $i++) {
+        if ($b[$i] -eq 0x40 -and $b[$i+1] -eq 0x42 -and $b[$i+2] -eq 0x0F -and $b[$i+3] -eq 0x00) {
+            $offset = $i - 200
+
+            # Search backward for '0A0h' 
+            # Pattern: 48 83 EC A0 (sub rsp, 0A0h)
+            for ($k = $offset; $k -gt ($offset - 50); $k--) {
+                if ($b[$k] -eq 0xA0) {
+                    
+                    # Step 3: Search backward for 'mov rax, rsp' prologue (48 8B C4)
+                    # This marks the true start of the function at 0x1800090B0
+                    for ($j = $k; $j -gt ($k - 40); $j--) {
+                        if ($b[$j] -eq 0x48 -and $b[$j+1] -eq 0x8B -and $b[$j+2] -eq 0xC4) {
+                            $fStart = $j
+                            break
+                        }
+                    }
+                }
+                if ($fStart -ne -1) { break }
+            }
+        }
+        if ($fStart -ne -1) { break }
+    }
+
+    if ($fStart -eq -1) { return 0 }
+    return (Get-VAFromOffset $b $fStart)
+}
+
 Clear-Host
 Write-Host
 
@@ -779,7 +1167,10 @@ if ($IsForge) {
     $hwid = Get-ProductHWID -FromStore 
 } elseif (-not $hwid) {
     # Generate new one using Internal Api
-    $hwid = Get-ProductHWID -CdKey $Key -DllPath $winRT
+    $hwid = Get-ProductHWID -DllPath $winRT
+}
+if (!([Int64]$hwid.HResult -eq 0L)){
+    throw "HWID IS NOT VALID !"
 }
 
 Write-Host "--- AS BINARY OUTPUT ---" -ForegroundColor Cyan
@@ -808,12 +1199,10 @@ if ($EncResult.Success) {
     }
 }
 
-if ($IsForge) {
-    $Req = Invoke-IIDRequest `
-        -UseApi -ApiMode SLGenerateOfflineInstallationIdEx `
-        -SkuID $SkuID
-    Write-Host (" - Offline  Call Api : {0}" -f $Req)
-}
+$Req = Invoke-IIDRequest `
+    -UseApi -ApiMode SLGenerateOfflineInstallationIdEx `
+    -SkuID $SkuID
+Write-Host (" - Offline  Call Api : {0}" -f $Req)
 
 $Info = Extract-KeyInfo `
     -BinaryKey $EncResult.BinaryKey
@@ -836,7 +1225,9 @@ if ($IsForge) {
     }
 }
 
-$Result = Get-PidGenXContext -ProductKey $Key -DllPath $pidIns
+$Result = Get-PidGenXContext `
+    -ProductKey $Key `
+    -DllPath $pidIns
 if ($Result.Success) {
     $Req = Invoke-IIDRequest `
         -RawStruct $Result.RawStruct `
