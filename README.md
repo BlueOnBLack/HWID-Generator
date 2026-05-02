@@ -10,7 +10,7 @@ A sophisticated PowerShell suite for low-level interaction with the **Windows So
     *   Generates **Offline Installation IDs (IID)** by combining the decrypted CD Key metadata (Group ID, Serial, Security ID) with the calculated Computer Hash.
     *   Invokes internal `InnerCall` methods at specific memory offsets, serving as a programmatic alternative to the standard `SLGenerateOfflineInstallationIdEx` API.
 *   **Architectural Interop**: Leverages `NativeInteropLib` to manage unmanaged memory pointers and execute functions directly from `pidgenx.dll`, `sppobjs.dll`, and `LicensingWinRT.dll`.
-*   **Dynamic Offset**: Find offset of internal function, dynamically,no fixed offset, support Windows 10, 11 Dll
+*   **Dynamic Offset**: Direct Call to internal funcation, Find offset dynamically, no fixed offset, support Windows 10, 11 Dll
 
 ## 📁 Core Logic Modules
 
