@@ -3,8 +3,8 @@
 
 // Size: 0x58 (88 bytes) // v12
 typedef struct _MSFT_PKEY_DATA {
-	uint64_t Reserved;          // 0x00
-	uint8_t  Signature[16];     // 0x08
+	uint64_t Header;            // 0x00
+	Guid     Algorithm;         // 0x08
 	uint32_t GroupID;           // 0x18
 	uint32_t ChannelID;         // 0x1C
 	uint32_t Serial;            // 0x20
