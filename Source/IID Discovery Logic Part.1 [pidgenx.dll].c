@@ -333,19 +333,19 @@ MSFT_PKEY_DATA Context Hex Dump:
 
 // Size: 0x58 (88 bytes) // v12
 typedef struct _MSFT_PKEY_DATA {
-    uint64_t Reserved;          // 0x00
-    uint8_t  Signature[16];     // 0x08
-    uint32_t GroupID;           // 0x18
-    uint32_t ChannelID;         // 0x1C
-    uint32_t Serial;            // 0x20
-    uint32_t Sequence;          // 0x24
-    uint64_t SecurityID;        // 0x28
-    uint32_t LicenseAttributes; // 0x30
-    uint32_t KeyType;           // 0x34
-    uint64_t IssuanceTimestamp; // 0x38
-    uint32_t ActivationFlags;   // 0x40
-    uint32_t ReservedPadding;   // 0x44
-    uint8_t  HardwareID[16];    // 0x48
+	uint64_t Header;            // 0x00
+	GUID     Algorithm;         // 0x08
+	uint32_t GroupID;           // 0x18
+	uint32_t ChannelID;         // 0x1C
+	uint32_t Serial;            // 0x20
+	uint32_t Sequence;          // 0x24
+	uint64_t SecurityID;        // 0x28
+	uint32_t LicenseAttributes; // 0x30
+	uint32_t KeyType;           // 0x34
+	uint64_t IssuanceTimestamp; // 0x38
+	uint32_t ActivationFlags;   // 0x40
+	uint32_t ReservedPadding;   // 0x44
+	uint8_t  HardwareID[16];    // 0x48
 } MSFT_PKEY_DATA;
 
 // Size: 0x98 (152 bytes) // lpMem
