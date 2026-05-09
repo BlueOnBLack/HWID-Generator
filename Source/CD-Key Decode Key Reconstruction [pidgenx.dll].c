@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdint>
 #include <immintrin.h>
+#pragma comment(lib, "Rpcrt4.lib")
 
 // Custom HRESULTs from the assembly mapping
 #define E_INVALID_KEY_FORMAT  ((HRESULT)0x80070057L) // E_INVALIDARG
@@ -31,10 +32,16 @@ typedef __int128 _OWORD; // standard GCC/Clang extension
 
 /* --- CONSTANTS & TABLES --- */
 
-// Static Salt from .rdata:00000001800A6788
-const uint8_t GEN4_SALT_DATA[16] = {
-    0xEF, 0x72, 0x06, 0x66, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+// .text:000000018000A050
+// Data1: 660672EFh 
+// Data2: 7809h 
+// Data3: 4CFDh 
+// Data4: 8D 54 41 B7 FB 73 89 88
+const GUID CLSID_IProductKeyAlgorithm2009 = {
+    0x660672EF,
+    0x7809,
+    0x4CFD,
+    { 0x8D, 0x54, 0x41, 0xB7, 0xFB, 0x73, 0x89, 0x88 }
 };
 
 // .rdata:00000001800A67F0 - CRC32 Table
@@ -85,26 +92,22 @@ typedef union _DECODED_DATA {
 } DECODED_DATA;
 #pragma pack(pop)
 
-#pragma pack(push, 1)
-typedef struct _LICENSE_CONTEXT
-{
-    uint8_t  header[0x18];     // 0x00
-
-    uint32_t RawSeedBits;      // 0x18
-    uint32_t GroupID;          // 0x1C
-    uint32_t Serial;           // 0x20
-    uint32_t ProductID;        // 0x24
-
-    uint64_t Security;         // 0x28
-
-    uint32_t InternalFlag;     // 0x30
-    uint32_t State;            // 0x34
-
-    uint8_t  xmm_block[0x10];  // 0x38 (THIS is var_60+SIMD region)
-
-    uint8_t  tail[0x10];       // 0x48 (matches xmm spill region)
-} LICENSE_CONTEXT;
-#pragma pack(pop)
+// Size: 0x58 (88 bytes)
+typedef struct _MSFT_PKEY_DATA {
+    uint64_t Header;            // 0x00
+    GUID     Algorithm;         // 0x08
+    uint32_t GroupID;           // 0x18
+    uint32_t ChannelID;         // 0x1C
+    uint32_t Serial;            // 0x20
+    uint32_t Sequence;          // 0x24
+    uint64_t SecurityID;        // 0x28
+    uint32_t LicenseAttributes; // 0x30
+    uint32_t KeyType;           // 0x34
+    uint64_t IssuanceTimestamp; // 0x38
+    uint32_t ActivationFlags;   // 0x40
+    uint32_t ReservedPadding;   // 0x44
+    uint8_t  HardwareID[16];    // 0x48
+} MSFT_PKEY_DATA;
 
 #pragma pack(push, 1)
 typedef struct _LICENSE_WORKSPACE
@@ -130,23 +133,7 @@ typedef struct _LICENSE_WORKSPACE
     union
     {
         uint8_t raw[96];
-
-        struct _LICENSE_CONTEXT
-        {
-            uint8_t  header[0x18];     // 0x00–0x17
-
-            uint32_t RawSeedBits;      // 0x18
-            uint32_t GroupID;          // 0x1C
-            uint32_t Sequence;         // 0x20
-            uint32_t ProductID;        // 0x24
-
-            uint64_t KeyType;          // 0x28
-
-            uint32_t InternalFlag;     // 0x30
-            uint32_t State;            // 0x34
-
-            uint8_t  TempWorkspace[0x40]; // SIMD / scratch overlap region
-        } ctx;
+        MSFT_PKEY_DATA ctx;
     };
 
     // =========================
@@ -233,71 +220,81 @@ __int64 __fastcall DecodeBase24(const wchar_t* szKey, __int64 a2, _BYTE* pOutByt
 // sub_180008BCC
 HRESULT ValidateAndUnswizzle(DECODED_DATA* in, uint8_t* out32, uint32_t* outHash)
 {
-    uint8_t data[16];
-    uint8_t blockA[16] = {};
-    uint8_t blockB[16] = {};
+    uint8_t raw[16];
+    memcpy(raw, in, 16);
 
-    memcpy(data, in, sizeof(data));
+    uint8_t v23[16] = {};
+    uint8_t v24[16] = {};
 
-    // Extract header flags (upper bits of payload metadata)
-    uint8_t flags = (uint8_t)(in->Half.High >> 48) & 0xF7;
+    uint8_t flags = raw[14] & 0xF7;
+    uint8_t v6 = flags & 0xFE;
 
-    // Assembly-accurate Checksum Reconstruction
-    uint8_t temp_lo = (data[12] >> 7) | (data[13] << 1);
-    uint8_t temp_hi = (flags << 1) | (data[13] >> 7);
-    uint16_t expected = ((uint16_t)temp_hi << 8) | temp_lo;
+    //
+    // expected CRC
+    //
+    uint16_t expected =
+        (((((flags << 1) | (raw[13] >> 7)) & 3) << 8)) |
+        ((raw[12] >> 7) | (raw[13] << 1));
 
-    // Remove checksum bits before hashing
-    data[12] &= 0x7F;
-    data[13] = 0;
-    data[14] = flags & ~1;
+    //
+    // CRC normalize
+    //
+    raw[12] &= 0x7F;
+    raw[13] = 0;
+    raw[14] = v6;
+    raw[15] = 0;
 
-    // Compute CRC-10
     uint32_t crc = 0xFFFFFFFF;
+
     for (int i = 0; i < 16; i++)
     {
-        uint8_t idx = (uint8_t)((crc >> 24) ^ data[i]);
-        crc = (crc << 8) ^ g_hash_table[idx];
+        crc =
+            g_hash_table[((crc >> 24) ^ raw[i]) & 0xFF]
+            ^ (crc << 8);
     }
 
-    uint16_t actual = (uint16_t)(~crc) & 0x3FF;
+    uint16_t actual = (~crc) & 0x3FF;
 
     if (expected != actual)
-        return E_INVALIDARG;
+        return 0x8007000D;
 
     if (outHash)
         *outHash = actual;
 
-    // --- Unswizzle ---
+    //
+    // v23
+    //
+    v23[0] = raw[0];
+    v23[1] = raw[1];
+    v23[2] = raw[2] & 0x0F;
 
-    // Copy first word directly
-// 1. Recover blockA (ID / Group / Sequence)
-    blockA[0] = data[0];
-    blockA[1] = data[1];
-    blockA[2] = data[2] & 0x0F; // Preserve lower nibble
-
-    // Repack Loop (Matches loc_180008CDF)
-    for (int i = 0; i < 3; i++) {
-        blockA[i + 4] = (data[i + 2] >> 4) | (data[i + 3] << 4);
+    for (int i = 0; i < 3; i++)
+    {
+        v23[4 + i] =
+            (raw[2 + i] >> 4) |
+            (raw[3 + i] << 4);
     }
 
-    // Special mixing for Byte 7 (Matches 0x180008D12)
-    blockA[7] = ((data[6] << 4) | (data[5] >> 4)) & 0x3F;
+    v23[7] =
+        ((raw[5] | (raw[6] << 8)) >> 4) & 0x3F;
 
-    // Flag injection (Matches 0x180008D61)
-    blockA[8] = data[8] ^ (flags & 1);
+    v23[8] = raw[8] ^ ((v6 >> 1) & 1);
 
-    // 2. Recover blockB (Security / KeyType) - THE MISSING PART
-    // Matches loc_180008D24 loop
-    for (int i = 0; i < 6; i++) {
-        blockB[i] = (data[i + 6] >> 2) | (data[i + 7] << 6);
+    //
+    // v24
+    //
+    for (int i = 0; i < 6; i++)
+    {
+        v24[i] =
+            (raw[7 + i] << 6) |
+            (raw[6 + i] >> 2);
     }
-    // Tail of blockB (Matches 0x180008D5A)
-    blockB[6] = (data[12] >> 2) & 0x1F;
 
-    // 3. Output
-    memcpy(out32, blockA, 16);
-    memcpy(out32 + 16, blockB, 16);
+    v24[6] =
+        ((raw[12] & 0x7F) >> 2) & 0x1F;
+
+    memcpy(out32, v23, 16);
+    memcpy(out32 + 16, v24, 16);
 
     return S_OK;
 }
@@ -371,237 +368,196 @@ HRESULT __fastcall CompressKey(const wchar_t* szKey, DECODED_DATA* pOutRaw, int*
 // sub_180008A58
 __int32 __fastcall UnpackLicenseContext(unsigned char* pDecodedKey, byte* pContext)
 {
-    // Work buffer for the 13-byte reconstructed license stream
-    uint8_t bitStream[16];
-    memset(bitStream, 0, sizeof(bitStream));
+    // The assembly uses a 16-byte stack buffer (v24[2] as __int64)
+    uint8_t v24[16];
+    memset(v24, 0, sizeof(v24));
 
-    // 1. Initial State: Check existence of extended data at offset 8
-    bitStream[0] = (*(uint32_t*)(pDecodedKey + 8) != 0) ? 1 : 0;
+    // 1. Initial Boolean (v24[0] = !v3)
+    v24[0] = (*(uint32_t*)(pDecodedKey + 8) != 0) ? 1 : 0;
 
-    // 2. Unpack Block A: 1-bit Left Shift
-    // Merges pDecodedKey[4-6] into bitStream[0-3]
+    // 2. Unpack Block A (The "do-while" v8=3 loop)
+    // Matches: *(_BYTE *)v2 |= 2 * v9; *v4++ |= v9 >> 7;
     for (int i = 0; i < 3; ++i) {
-        uint8_t sourceByte = pDecodedKey[i + 4];
-        bitStream[i] = (bitStream[i] & 0x01) | (sourceByte << 1);
-        bitStream[i + 1] = (sourceByte >> 7);
+        uint8_t v9 = pDecodedKey[i + 4];
+        v24[i] &= 0x01;
+        v24[i + 1] &= ~0x01; // v4 points to v2+1
+        v24[i] |= (2 * v9);
+        v24[i + 1] |= (v9 >> 7);
     }
 
-    // 3. Patching Block A: Insert bits from Key[7] into Stream[3]
-    // Preserves bits 0 and 7 of Stream[3], overwrites bits 1-6
-    uint8_t bridgeBits = pDecodedKey[7] << 1;
-    bitStream[3] = (bitStream[3] & 0x81) | (bridgeBits & 0x7E);
+    // 3. The 0x7E Patch (Bridge bits)
+    // ASM: BYTE3(v24[0]) ^= (BYTE3(v24[0]) ^ (2 * *(_BYTE *)(a1 + 7))) & 0x7E;
+    v24[3] ^= (v24[3] ^ (2 * pDecodedKey[7])) & 0x7E;
 
-    // 4. Unpack Block B: 7-bit Left Shift
-    // Merges pDecodedKey[3-4] into bitStream[3-5]
+    // 4. Unpack Block B (The "do-while" v12=2 loop)
+    // Matches: *v10++ |= v13 << 7; *v11++ |= v13 >> 1;
     for (int i = 0; i < 2; ++i) {
-        uint8_t sourceByte = pDecodedKey[i + 3];
-        bitStream[i + 3] = (bitStream[i + 3] & 0x7F) | (sourceByte << 7);
-        bitStream[i + 4] = (bitStream[i + 4] & 0x80) | (sourceByte >> 1);
+        uint8_t v13 = pDecodedKey[i + 3];
+        v24[i + 3] &= ~0x80;
+        v24[i + 4] &= 0x80;
+        v24[i + 3] |= (v13 << 7);
+        v24[i + 4] |= (v13 >> 1);
     }
 
-    // 5. Unpack Metadata: Align bits from Key[2]
-    uint8_t metaByte = pDecodedKey[2];
-    bitStream[5] = (bitStream[5] & 0x7F) | (metaByte << 7);        // High bit
-    bitStream[6] = (bitStream[6] & 0xF8) | ((metaByte >> 1) & 0x07); // Low 3 bits
+    // 5. Unpack Metadata (The v16 block)
+    // ASM: BYTE5(v24[0]) = BYTE5(v24[0]) & 0x7F | (v16 << 7);
+    // ASM: BYTE6(v24[0]) ^= (BYTE6(v24[0]) ^ (v16 >> 1)) & 7;
+    uint8_t v16_val = pDecodedKey[2];
+    v24[5] = (v24[5] & 0x7F) | (v16_val << 7);
+    v24[6] ^= (v24[6] ^ (v16_val >> 1)) & 0x07;
 
-    // 6. Unpack Block C: 3-bit Left Shift
-    // Merges pDecodedKey[16-21] into bitStream[6-12]
+    // 6. Unpack Block C (The "do-while" v17=6 loop)
+    // Matches: *v18++ |= 8 * v20; *v15++ |= v20 >> 5;
     for (int i = 0; i < 6; ++i) {
-        uint8_t sourceByte = pDecodedKey[i + 16];
-        bitStream[i + 6] = (bitStream[i + 6] & 0x07) | (sourceByte << 3);
-        bitStream[i + 7] = (bitStream[i + 7] & 0xF8) | (sourceByte >> 5);
+        uint8_t v20 = pDecodedKey[i + 16];
+        v24[i + 6] &= 0x07;
+        v24[i + 7] &= 0xF8;
+        v24[i + 6] |= (8 * v20);
+        v24[i + 7] |= (v20 >> 5);
     }
 
-    // --- FINAL PACKING TO CONTEXT ---
+    // 7. Final Byte Construction (Offset 0x0C)
+    // ASM: v21 = *(_BYTE *)(v14 + 6); (Key[16+6] -> Key[22])
+    // ASM: v22 = BYTE4(v24[1]) & 7; (v24[12] & 7)
+    uint8_t v21_val = pDecodedKey[22];
+    uint8_t v22_val = v24[12] & 0x07;
 
-    // Write primary 8-byte QWORD (Offsets 0.0 - 0.7)
-    *(uint64_t*)(pContext + 0x00) = *(uint64_t*)&bitStream[0];
+    // Output mapping
+    *(uint64_t*)(pContext + 0x00) = *(uint64_t*)&v24[0];
+    *(uint32_t*)(pContext + 0x08) = *(uint32_t*)&v24[8];
+    pContext[0x0C] = v22_val | (8 * v21_val);
 
-    // Write secondary 4-byte DWORD (Offsets 0.8 - 0.B)
-    *(uint32_t*)(pContext + 0x08) = *(uint32_t*)&bitStream[8];
-
-    // Write final byte (Offset 0.C)
-    // Combines Key[22] with the remainder of our bitStream
-    uint8_t finalKeyByte = pDecodedKey[22];
-    uint8_t streamRemnant = bitStream[12] & 0x07;
-    pContext[0x0C] = (finalKeyByte << 3) | streamRemnant;
-
-    return 0; // Success
-}
-
-// KeyInfo. BOB [MDL]
-bool GetInfo_Gen4(const uint8_t* key3, LICENSE_WORKSPACE* pContext) {
-    if (!key3 || !pContext) return false;
-
-    // Bob's GroupId extraction (Bits 0-19)
-    uint32_t groupid = 0;
-    groupid |= key3[0];
-    groupid |= (uint32_t)key3[1] << 8;
-    groupid |= (uint32_t)(key3[2] & 0x0F) << 16;
-    pContext->ctx.GroupID = groupid;
-
-    // Bob's KeyId extraction (Bits 20-49)
-    uint32_t keyid = 0;
-    keyid |= (key3[2] >> 4);
-    keyid |= (uint32_t)key3[3] << 4;
-    keyid |= (uint32_t)key3[4] << 12;
-    keyid |= (uint32_t)key3[5] << 20;
-    keyid |= (uint32_t)(key3[6] & 0x3F) << 28;
-    pContext->ctx.Sequence = keyid;
-
-    // Bob's Secret extraction (Bits 50-113)
-    uint64_t secret = 0;
-    secret |= (key3[6] >> 2);
-    secret |= (uint64_t)key3[7] << 6;
-    secret |= (uint64_t)key3[8] << 14;
-    secret |= (uint64_t)key3[9] << 22;
-    secret |= (uint64_t)key3[10] << 30;
-    secret |= (uint64_t)key3[11] << 38;
-    secret |= (uint64_t)(key3[12] & 0x1F) << 46;
-    // Mapping Secret to KeyType for your struct
-    pContext->ctx.KeyType = secret;
-
-    return true;
+    return 0;
 }
 
 // sub_1800090B0
 HRESULT DecodeLicenseContext(
     const wchar_t* ProductKey,
-    LICENSE_CONTEXT* ctx,
-    uint32_t* pHash,
-    BOOLEAN AsKeyInfo)
+    MSFT_PKEY_DATA* ctx,
+    uint32_t* pHash)
 {
+    if (!ctx || !ProductKey) return E_INVALIDARG;
 
-    if (!ctx) return E_POINTER;
-    if (!ProductKey) return E_INVALIDARG;
+    LICENSE_WORKSPACE workspace = { 0 };
+    MSFT_PKEY_DATA* pOut = &workspace.ctx;
 
-    HRESULT hr = S_OK;
-    LICENSE_WORKSPACE Context = { 0 };
-    LICENSE_WORKSPACE* pContext = &Context;
+    // 1. Base24 -> BigInt
+    HRESULT hr = CompressKey(ProductKey, &workspace.encoded, &workspace.isKeyValid);
+    if (FAILED(hr)) return hr;
 
-    // =====================================================
-    // 1. COMPRESS (Base24 decode -> encoded[0])
-    // =====================================================
-    hr = CompressKey(
-        ProductKey,
-        &pContext->encoded,
-        &pContext->isKeyValid
-    );
+    // 2. Unswizzle (CRC + Bit Reorder)
+    // Result v14/v15 goes into workspace.unswizzled
+    hr = ValidateAndUnswizzle(&workspace.encoded, workspace.unswizzled, pHash);
+    if (FAILED(hr)) return hr;
 
-    if (FAILED(hr))
-        return hr;
+    // 3. Unpack HWID (The 3-bit Shift Logic)
+    // Destination: Offset 0x48
 
-    // =====================================================
-    // 2. INTERNAL FLAG (matches buffer[0x30])
-    // =====================================================
-    *(uint32_t*)&pContext->raw[0x30] = 1;
+    hr = UnpackLicenseContext(workspace.unswizzled, pOut->HardwareID);
+    if (FAILED(hr)) return hr;
 
-    // =====================================================
-    // KEY INFO FAST PATH
-    // =====================================================
-    if (pContext->isKeyValid && AsKeyInfo)
-    {
-        if (GetInfo_Gen4(pContext->encoded.Bytes, pContext))
-            return S_OK;
-
-        return E_FAIL;
+    std::cout << "-----------------------------------------------" << std::endl;
+    printf("UnpackLicenseContext Results:\n");
+    unsigned char* pRaw = (unsigned char*)&workspace.unswizzled;
+    for (int i = 0; i < 32; ++i) {
+        printf("%02X ", pRaw[i]);
+        if ((i + 1) % 16 == 0) printf("\n");
     }
+    std::cout << "-----------------------------------------------" << std::endl;
 
-    if (!pContext->isKeyValid)
-        return S_OK;
+    // --- 4. MANUAL MAPPING (Matching ASM sub_1800090B0) ---
 
-    // =====================================================
-    // 3. UNSWIZZLE
-    // =====================================================
-    hr = ValidateAndUnswizzle(
-        &pContext->encoded,
-        pContext->unswizzled,
-        pHash
-    );
+    // Algorithm GUID (Offset 0x08)
+    pOut->Algorithm = CLSID_IProductKeyAlgorithm2009;
 
-    if (hr == (HRESULT)0x8007000D)
-        return (HRESULT)0x80041111;
+    // GroupID (Offset 0x18) - DWORD 0 of v14
+    pOut->GroupID = *(uint32_t*)&workspace.unswizzled[0];
 
-    if (FAILED(hr))
-        return hr;
+    uint32_t channelData =
+        *(uint32_t*)&workspace.unswizzled[4];
 
-    // =====================================================
-    // 4. UNPACK
-    // IMPORTANT: assembly writes into SAME CONTEXT region
-    // =====================================================
-    hr = UnpackLicenseContext(
-        pContext->unswizzled,
-        pContext->unpack
-    );
+    pOut->ChannelID = channelData / 1000000;
+    pOut->Serial = channelData % 1000000;
 
-    if (FAILED(hr))
-        return hr;
+    // THIS OFFSET IS WRONG CURRENTLY
+    pOut->SecurityID =
+        *(uint64_t*)&workspace.unswizzled[16];
 
-    // =====================================================
-    // 5. KEYTYPE
-    // =====================================================
-    uint64_t keyType = *(uint64_t*)&pContext->unswizzled[16];
-    *(uint64_t*)&pContext->raw[0x28] = keyType;
+    // License Attr & Key Type (Offset 0x30 & 0x34)
+    pOut->LicenseAttributes = 1;
+    pOut->KeyType = 1;
+    pOut->IssuanceTimestamp = 0;
+    pOut->ActivationFlags = 0;
+    pOut->ReservedPadding = 0;
 
-    // =====================================================
-    // 6. SALT + STATE
-    // =====================================================
-    memcpy(&pContext->raw[0x08], GEN4_SALT_DATA, 16);
-    *(uint32_t*)&pContext->raw[0x34] = 1;
+    // 5. Final Copy to Output
+    memcpy(ctx, pOut, 0x58);
 
-    // =====================================================
-    // 7. GROUP + SEQUENCE (Bob model)
-    // =====================================================
-    uint32_t sequenceData = *(uint32_t*)&pContext->unswizzled[4];
-    uint32_t sequence = sequenceData % 1000000;
-
-    uint64_t rawData = *(uint64_t*)&pContext->unswizzled[0];
-    uint32_t groupID = (uint32_t)(rawData & 0x3FFFF);
-
-    *(uint32_t*)&pContext->raw[0x1C] = groupID;
-    *(uint32_t*)&pContext->raw[0x20] = sequence;
-
-    // =====================================================
-    // 8. PRODUCT + SEED
-    // =====================================================
-    *(uint32_t*)&pContext->raw[0x24] =
-        *(uint32_t*)&pContext->unswizzled[8];
-
-    *(uint32_t*)&pContext->raw[0x18] =
-        *(uint32_t*)&pContext->unswizzled[0];
-
-    memcpy(ctx, pContext->raw, sizeof(LICENSE_CONTEXT));
-    return hr;
+    return S_OK;
 }
 
 int main() {
 
-    /*
-        Key      : K8KNG-MGG4H-KX82M-M8QYW-DGRFH
-        Integer  : 4441847703199715836355246925287693
-        Group    : 4365
-        Serial   : 11
-        Security : 12
-        Checksum : 438
-        Upgrade  : 0
-        Extra    : 0
-    */
 
-    LICENSE_CONTEXT ctx = { 0 };
+    MSFT_PKEY_DATA ctx = { 0 };
     const wchar_t* myKey = L"K8KNG-MGG4H-KX82M-M8QYW-DGRFH";
 
-    std::cout << "\n";
     std::cout << "--- License Decoder Tool ---" << std::endl;
     uint32_t pHash = 0;
-    HRESULT hr = DecodeLicenseContext(myKey, &ctx, &pHash, 0);
+    HRESULT hr = DecodeLicenseContext(myKey, &ctx, &pHash);
 
     if (SUCCEEDED(hr)) {
-        std::wcout << L"Key:        " << myKey << std::endl;
-        std::cout << "Result:     VALID" << std::endl;
-        std::cout << "Group ID:   " << ctx.GroupID << std::endl;
-        std::cout << "Serial:     " << ctx.Serial << std::endl;
-        std::cout << "Security:   0x" << std::hex << ctx.Security << std::endl;
-        std::cout << "Hash:       " << std::dec << pHash << std::endl;
+        std::wcout << L"Key:            " << myKey << std::endl;
+        std::cout << "Result:         VALID" << std::endl;
+        std::cout << "-----------------------------------------------" << std::endl;
+
+        // Use the 'ctx' variable directly, not a pointer to it
+        printf("Algorithm ID:   {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}\n",
+            ctx.Algorithm.Data1, ctx.Algorithm.Data2, ctx.Algorithm.Data3,
+            ctx.Algorithm.Data4[0], ctx.Algorithm.Data4[1], ctx.Algorithm.Data4[2],
+            ctx.Algorithm.Data4[3], ctx.Algorithm.Data4[4], ctx.Algorithm.Data4[5],
+            ctx.Algorithm.Data4[6], ctx.Algorithm.Data4[7]);
+
+        // 2. Print Numeric IDs
+        std::cout << "Group ID:       " << std::dec << ctx.GroupID << std::endl;
+        std::cout << "Channel ID:     " << ctx.ChannelID << std::endl;
+        std::cout << "Serial:         " << ctx.Serial << std::endl;
+        std::cout << "Sequence:       " << ctx.Sequence << std::endl;
+        std::cout << "Security ID:    0x" << std::hex << std::uppercase << ctx.SecurityID << std::endl;
+
+        // 3. Print Flags and Attributes
+        std::cout << std::dec << std::nouppercase;
+        std::cout << "Key Type:       " << ctx.KeyType << std::endl;
+        std::cout << "License Attr:   0x" << std::hex << ctx.LicenseAttributes << std::endl;
+        std::cout << "Activation Flg: 0x" << ctx.ActivationFlags << std::dec << std::endl;
+
+        // 4. Print Hardware ID (HWID) as Hex String
+        std::cout << "Hardware ID:    ";
+        for (int i = 0; i < 16; ++i) {
+            std::cout << std::hex << std::setw(2) << std::setfill('0')
+                << (int)ctx.HardwareID[i] << (i < 15 ? ":" : "");
+        }
+        std::cout << std::dec << std::setfill(' ') << std::endl;
+
+        // 5. Print internal Hash/CRC
+        std::cout << "Internal Hash:  " << pHash << std::endl;
+
+        std::cout << "-----------------------------------------------" << std::endl;
+        std::cout << "End Results:  " << std::endl;
+        unsigned char* pRaw = (unsigned char*)&ctx;
+        for (int i = 0; i < 88; ++i) {
+            printf("%02X ", pRaw[i]);
+            if ((i + 1) % 16 == 0) printf("\n");
+        }
+        std::cout << "\n-----------------------------------------------" << std::endl;
+        std::cout << "Real Api Call Memory Dump!" << std::endl;
+        std::cout << "00 00 00 00 00 00 00 00 EF 72 06 66 09 78 FD 4C" << std::endl;
+        std::cout << "8D 54 41 B7 FB 73 89 88 0D 11 00 00 00 00 00 00" << std::endl;
+        std::cout << "0B 00 00 00 00 00 00 00 0C 00 00 00 00 00 00 00" << std::endl;
+        std::cout << "01 00 00 00 01 00 00 00 0D 11 B0 00 00 00 30 00" << std::endl;
+        std::cout << "00 00 00 00 00 DB 08 00 16 00 00 80 86 08 60 00" << std::endl;
+        std::cout << "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00" << std::endl;
+        std::cout << "-----------------------------------------------" << std::endl;
     }
     else {
         std::cerr << "Result:  INVALID (HRESULT: 0x" << std::hex << hr << ")" << std::endl;
