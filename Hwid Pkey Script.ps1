@@ -1079,7 +1079,8 @@ function Invoke-IIDRequest {
     if (-not [System.IO.Path]::IsPathRooted($PidDll)) {
         $PidDll = Join-Path $env:windir "System32\pidgenx.dll"
     }
-    [Int64]$offset = Get-PidGenRVA -dllpath $PidDll
+    #[Int64]$offset = Get-PidGenRVA -dllpath $PidDll
+    [Int64]$offset = Get-PKey2009EngineRVA -dllpath $PidDll
 
     $param = $PSCmdlet.ParameterSetName
     if ($param -match "FromStruct|FromForge") {
@@ -1101,13 +1102,15 @@ function Invoke-IIDRequest {
             .text:000000018000A050                 dw 4CFDh                ; Data3
             .text:000000018000A050                 db 8Dh, 54h, 41h, 0B7h, 0FBh, 73h, 89h, 88h; Data4
             #>
-            $IProductKeyAlgorithm2009 = [Guid]'660672EF-7809-4CFD-8D54-41B7FB738988'
+
+            # This part only In use, if you use selector Function
+            #$IProductKeyAlgorithm2009 = [Guid]'660672EF-7809-4CFD-8D54-41B7FB738988'
+            #$IProductKeyAlgorithm2009.ToByteArray().CopyTo($buffer, 0x08)
 
             # Copy Settings
-            $IProductKeyAlgorithm2009.ToByteArray().CopyTo($buffer, 0x08)
-            [BitConverter]::GetBytes([int]$GroupID).CopyTo($buffer, 0x18)
-            [BitConverter]::GetBytes([int]$Serial).CopyTo($buffer, 0x20)
-            [BitConverter]::GetBytes([long]$SecurityID).CopyTo($buffer, 0x28)
+            [BitConverter]::GetBytes([Int32]$GroupID).CopyTo($buffer, 0x18)
+            [BitConverter]::GetBytes([Int32]$Serial).CopyTo($buffer, 0x20)
+            [BitConverter]::GetBytes([Int64]$SecurityID).CopyTo($buffer, 0x28)
 
         }
 
@@ -1119,7 +1122,9 @@ function Invoke-IIDRequest {
 
             $pOutString = ''
             $signatureBase = [IntPtr]::Add($hBuffer, 0x8)
-            $params = $signatureBase, 0L, [int64]$HWID, [int64]0L, [ref]$pOutString
+            
+           #$params = $signatureBase, 0L, [int64]$HWID, [int64]0L, [ref]$pOutString  # MAIN SELECTOR Params
+            $params = $signatureBase, [int64]$HWID, 0L, [ref]$pOutString             # RVA2009 Direct Params
             $hr = Invoke-UnmanagedMethod `
                 -Dll $DllPath `
                 -Function "InnerCall" `
@@ -1494,6 +1499,29 @@ function Get-PidGenRVA {
     if ($funcStartOffset -eq -1) { return $null }
     return Get-VAFromOffset $dllBytes $funcStartOffset
 }
+function Get-PKey2009EngineRVA {
+    param([string]$dllpath)
+
+    $b = [IO.File]::ReadAllBytes($dllpath)
+    $i = [Array]::IndexOf($b, [byte]0xB8)
+
+    while ($i -ge 0) {
+
+        if ($b[$i + 1] -eq 0x83) {
+
+            for ($j = $i; $j -ge 0; $j--) {
+
+                if (
+                    ([BitConverter]::ToUInt32($b, $j) -band 0xFFFFFF) -eq 0x5C8948
+                ) {
+                    return Get-VAFromOffset $b $j
+                }
+            }
+        }
+
+        $i = [Array]::IndexOf($b, [byte]0xB8, $i + 1)
+    }
+}
 function Get-DecodeRVA {
     param (
         [string]$dllpath = "$env:windir\system32\sppwinob.dll"
@@ -1776,13 +1804,21 @@ if ($Result.Success) {
 }
 
 if ($SPP) {
-    $hwid = Get-ProductHWID -FromStore 
-    Write-Host
-    Write-Host "Parse RT Generated HWID" -ForegroundColor Magenta
-    Get-HWIDDetails -Bytes $hwid.RawBytes | Format-List
+    try {
+        $SppObj = [PSObject]@{
+            LABEL = 'Parse SPP Store HWID'
+            DATA  = Get-ProductHWID -FromStore | select -ExpandProperty RawBytes
+        }
+    } catch {}
+    if ($SppObj -and $SppObj.DATA) {
+        Invoke-HWIDParser -Bytes $SppObj.DATA -Label $SppObj.LABEL
+    }
 }
 
-Write-Host
-$hwid = Get-ProductHWID -DllPath $winRT
-Write-Host "Parse SPP Store HWID" -ForegroundColor Magenta
-Get-HWIDDetails -Bytes $hwid.RawBytes | Format-List
+$RtObj = [PSObject]@{
+    LABEL = 'Parse WinRT Generated HWID'
+    DATA  = Get-ProductHWID -DllPath $winRT | select -ExpandProperty RawBytes
+}
+if ($RtObj -and $RtObj.DATA) {
+    Invoke-HWIDParser -Bytes $RtObj.DATA -Label $RtObj.LABEL
+}
