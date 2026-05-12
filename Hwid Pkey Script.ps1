@@ -1060,6 +1060,7 @@ function Invoke-IIDRequest {
         $Module = [AppDomain]::CurrentDomain.DefineDynamicAssembly("null", 1).DefineDynamicModule("OFF", $False).DefineType("null")
         @(
             @('null', 'null', [int], @()), # place holder
+            @('GetPKeyData',                        'pidgenx.dll', [Int32], @([string], [string], [IntPtr], [IntPtr], [Int64], [String].MakeByRefType(), [Int64].MakeByRefType(), [Int64].MakeByRefType(), [Int64].MakeByRefType(), [IntPtr])),
             @('SLOpen',                             'sppc.dll', [Int32], @([IntPtr].MakeByRefType())),
             @('SLClose',                            'sppc.dll', [Int32], @([IntPtr])),
             @('SLGenerateOfflineInstallationIdEx',  'sppc.dll', [Int32], @([IntPtr], [Guid].MakeByRefType(), [Int32], [IntPtr].MakeByRefType())),
@@ -1161,12 +1162,7 @@ function Invoke-IIDRequest {
                 )
             }
             $Global:OFF::SLClose($hSLC) | Out-Null
-        }
-
-        if(!([PSTypeName]'LibTSforge.SPP.ProductConfig').Type) {
-            Write-Warning "Missing nececery libraries !"
-            Write-Warning "Please load first PkeyConsole"
-            return
+            return $null
         }
 
         if ($ApiMode -eq 'GetPKeyData') {
@@ -1180,9 +1176,11 @@ function Invoke-IIDRequest {
                 Write-Warning  "Validation Error: PKeyConfig file not found at: $configPath"
                 return
             }
-            return (
-                Get-PKeyData -key $Key -configPath $configPath -HWID $HWID
-            )
+            
+            $IID = ""
+            $Req = $Global:OFF::GetPKeyData($Key, $ConfigPath, 0L, 0L, $HWID, [ref]$IID, [ref]0L, [ref]0L, [ref]0L, 0L)
+            if ($Req -ge 0L) { return $IID }
+            return $null
         }
     }
 }
@@ -1705,7 +1703,7 @@ if (!([PSTypeName]'HwidGetCurrentEx.CPUID').Type) {
 Clear-Host
 Write-Host
 
-$Key        = "89VHN-B7F29-WFYK9-76GQH-6X2MV"
+$Key        = "7H674-NPCV7-7QVJ3-RQG68-78T77"
 $SkuID      = [Guid]'ed655016-a9e8-4434-95d9-4345352c2552'
 $PKeyConfig = "C:\windows\System32\spp\tokens\pkeyconfig\pkeyconfig.xrm-ms"
 
@@ -1762,15 +1760,13 @@ $Req = Invoke-IIDRequest `
 Write-Host "# SLGenerateOfflineInstallationIdEx Api Call" -ForegroundColor Green
 Write-Host (" - Offline  Call Api : {0}" -f $Req)
 
-if ($SPP) {
-    $Req = Invoke-IIDRequest `
-        -UseApi -ApiMode GetPKeyData `
-        -Key $Key -configPath $PKeyConfig `
-        -HWID $hwid.ShortHWID
-    if ($Req -and $Req[3]) {
-        Write-Host "# GetPKeyData Api Call" -ForegroundColor Green
-        Write-Host (" - PKeyData Call Api : {0}" -f $Req[3].Value)
-    }
+$Req = Invoke-IIDRequest `
+    -UseApi -ApiMode GetPKeyData `
+    -HWID $HWID.ShortHWID -Key $Key -ConfigPath $PKeyConfig
+
+if (-not [string]::IsNullOrEmpty($req)) {
+    Write-Host "# GetPKeyData Api Call" -ForegroundColor Green
+    Write-Host (" - PKeyData Call Api : {0}" -f $req)
 }
 
 $Info = Parse-BinaryKey `
