@@ -1013,7 +1013,7 @@ function Encode-BinaryKey {
         # ProductKey must be in BOTH sets to work everywhere
         [Parameter(Mandatory = $true, ParameterSetName = 'Manual')]
         [Parameter(Mandatory = $true, ParameterSetName = 'Modern')]
-        [string]$ProductKey,
+        [string]$CdKey,
 
         # Only used in Manual mode
         [Parameter(Mandatory = $true, ParameterSetName = 'Manual')]
@@ -1034,14 +1034,14 @@ function Encode-BinaryKey {
         [CmdletBinding()]
         param (
             [Parameter(Mandatory = $true)]
-            [string]$ProductKey
+            [string]$CdKey
         )
 
         # Standard Microsoft Base24 Alphabet
         $Alphabet = "BCDFGHJKMPQRTVWXY2346789"
     
         # Remove dashes and force uppercase
-        $RawKey = $ProductKey.Replace("-", "").ToUpper()
+        $RawKey = $CdKey.Replace("-", "").ToUpper()
         if ($RawKey.Length -ne 25) { throw "Key must be 25 characters." }
 
         # This buffer holds the mapped values (0-23)
@@ -1119,13 +1119,13 @@ function Encode-BinaryKey {
 
         if ($Modern.IsPresent) {
             $hr = 0
-            $binBytes = EncodeKey -ProductKey $Key
+            $binBytes = EncodeKey -CdKey $CdKey
         } else {
             $DllPath = if ([String]::IsNullOrEmpty($CustomPath)) { $DllName } else { $CustomPath }
             $hr = Invoke-UnmanagedMethod `
                 -Dll $DllPath `
                 -Function "Inner" `
-                -Values @($ProductKey, $binKeyPtr, [uint32]0x10, $flagPtr) `
+                -Values @($CdKey, $binKeyPtr, [uint32]0x10, $flagPtr) `
                 -Sub $Offset
             if ($hr -ge 0) {
                 $binBytes = New-Object byte[] 0x10
@@ -1135,11 +1135,11 @@ function Encode-BinaryKey {
 
         if ($hr -ge 0) {
             return [PSCustomObject]@{
-                Success   = $true
-                BinaryKey = $binBytes
-                HexString = ($binBytes | ForEach-Object { "{0:X2}" -f $_ }) -join " "
-                IsModernN = [bool]([Marshal]::ReadInt32($flagPtr))
-                HResult   = "0x$($hr.ToString('X8'))"
+                Success    = $true
+                Data       = $binBytes
+                HexString  = ($binBytes | ForEach-Object { "{0:X2}" -f $_ }) -join " "
+                IsModernN  = [bool]([Marshal]::ReadInt32($flagPtr))
+                HResult    = "0x$($hr.ToString('X8'))"
             }
         }
 
@@ -1156,7 +1156,7 @@ function Decode-BinaryKey {
     param (
         [Parameter(Mandatory = $true, ParameterSetName = 'Manual')]
         [Parameter(Mandatory = $true, ParameterSetName = 'Modern')]
-        [byte[]]$BinaryKey,
+        [byte[]]$BinaryData,
 
         [Parameter(Mandatory = $false, ParameterSetName = 'Manual')]
         [string]$DllPath = "sppwinob.dll",
@@ -1258,7 +1258,7 @@ function Decode-BinaryKey {
     
     if ($Modern.IsPresent) {
         return (
-            DecodeKey -bCDKeyArray $BinaryKey
+            DecodeKey -bCDKeyArray $BinaryData
         )
     }
 
@@ -1272,7 +1272,7 @@ function Decode-BinaryKey {
     }
     $Offset = Get-DecodeRVA -dllpath $DllbaSe
 
-    if ($BinaryKey.Length -ne 16) {
+    if ($BinaryData.Length -ne 16) {
         Write-Error "BinaryKey must be exactly 16 bytes (128-bit)."
         return
     }
@@ -1281,7 +1281,7 @@ function Decode-BinaryKey {
     $binKeyPtr = [Marshal]::AllocHGlobal(0x10) 
 
     try {
-        [Marshal]::Copy($BinaryKey, 0, $binKeyPtr, 16)
+        [Marshal]::Copy($BinaryData, 0, $binKeyPtr, 16)
 
         $handle = $null
         if ($pPtr) {
@@ -1298,17 +1298,17 @@ function Decode-BinaryKey {
             -sub $Offset
 
         if ($hr -ge 0) {
-            $ProductKey = ''
+            $CdKey = ''
             if ($pPtr) {
-                $ProductKey = [Marshal]::PtrToStringAuto(
+                $CdKey = [Marshal]::PtrToStringAuto(
                     [Marshal]::ReadIntPtr($handle))
             } else {
-                $ProductKey = [Marshal]::PtrToStringAuto($poBox)
+                $CdKey = [Marshal]::PtrToStringAuto($poBox)
             }
 
             return [PSCustomObject]@{
                 Success    = $true
-                ProductKey = $ProductKey
+                ProductKey = $CdKey
                 HResult    = "0x$($hr.ToString('X8'))"
             }
         } 
@@ -1340,16 +1340,23 @@ function Decode-BinaryKey {
 Clear-Host
 Write-Host
 
+$Key = 'DXG7C-N36C4-C4HTG-X4T3X-2YV77'
+$BinKey = Encode-BinaryKey -CdKey $Key -Modern
+$info = Parse-BinaryKey -BinaryData $BinKey.Data
+$Source = [System.BitConverter]::ToString($BinKey.Data)
+
 $Key
-$info = Parse-BinaryKey -BinaryKey $EncResult.BinaryKey
-$Source = [System.BitConverter]::ToString($EncResult.BinaryKey)
+$Source
 $info | Format-Table
 
 $pKey = Pack-BinaryKey -Group $info.Group -Serial $info.Serial -Security $info.Security -IsNKey $true
-$newKey = Decode-BinaryKey -BinaryKey $pKey -Modern
-$newKey
+$newKey = Decode-BinaryKey -BinaryData $pKey -Modern
 $New = [System.BitConverter]::ToString($pKey)
-Parse-BinaryKey -BinaryKey $pKey | Format-Table
+
+$newKey
+$New
+Parse-BinaryKey -BinaryData $pKey | Format-Table
+
 Write-Host ("Binary -> IS MAtch ? {0}" -f ($Source -eq $new)) -ForegroundColor Green
 Write-Host ("Key    -> IS MAtch ? {0}" -f ($newKey -eq $Key)) -ForegroundColor Green
 Write-Host
@@ -1390,12 +1397,12 @@ $CrcTable = @(
 )
 function Get-KeyChecksum {
     param (
-        [byte[]]$BinaryKey
+        [byte[]]$BinaryData
     )
 
     # Replicate the sanitization/manipulation seen in sub_180020A1C
     # The code works on a copy (v35)
-    $v35 = $BinaryKey.Clone()
+    $v35 = $BinaryData.Clone()
 
     # ASM: v11 = HIWORD(_mm_srli_si128(v7, 8).m128i_u64[0]); (This is Byte 14)
     $v11 = [int]$v35[14]
@@ -1433,7 +1440,7 @@ function Parse-BinaryKey {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
-        [byte[]]$BinaryKey
+        [byte[]]$BinaryData
     )
     
     # Pidgenx.dll, Retail Version, sub_180020A1C
@@ -1443,13 +1450,13 @@ function Parse-BinaryKey {
     # $security = [Marshal]::ReadInt32(a2, 0x10)
 
     # 1. Group ID: Straight UInt16
-    $groupId = [BitConverter]::ToUInt16($BinaryKey, 0)
+    $groupId = [BitConverter]::ToUInt16($BinaryData, 0)
 
     # 2. Serial Logic: Fixed with 0xFF mask
     $serialBytes = New-Object byte[] 4 
     for ($i = 0; $i -lt 3; $i++) {
         # Mask the result to 8 bits to stay within [byte] limits
-        $rawSerial = (($BinaryKey[$i + 3] -band 0xFF) -shl 4) -bor ($BinaryKey[$i + 2] -shr 4)
+        $rawSerial = (($BinaryData[$i + 3] -band 0xFF) -shl 4) -bor ($BinaryData[$i + 2] -shr 4)
         $serialBytes[$i] = [byte]($rawSerial -band 0xFF)
     }
     $serial = [BitConverter]::ToUInt32($serialBytes, 0)
@@ -1458,13 +1465,13 @@ function Parse-BinaryKey {
     $securityBytes = New-Object byte[] 8
     for ($i = 0; $i -lt 6; $i++) {
         # Mask the result to 8 bits to stay within [byte] limits
-        $rawSec = (($BinaryKey[$i + 7] -band 0xFF) -shl 6) -bor ($BinaryKey[$i + 6] -shr 2)
+        $rawSec = (($BinaryData[$i + 7] -band 0xFF) -shl 6) -bor ($BinaryData[$i + 6] -shr 2)
         $securityBytes[$i] = [byte]($rawSec -band 0xFF)
     }
     $security = [BitConverter]::ToUInt64($securityBytes, 0)
 
     # 4. Modern N Flag
-    $isNKey = ($BinaryKey[14] -band 0x08) -ne 0
+    $isNKey = ($BinaryData[14] -band 0x08) -ne 0
 
     return [Psobject]@{
         Group    = $groupId
@@ -1487,41 +1494,41 @@ function Pack-BinaryKey {
     # $serial   = [Marshal]::ReadInt32(a2, 0x04)
     # $security = [Marshal]::ReadInt32(a2, 0x10)
 
-    $BinaryKey = New-Object byte[] 16
+    $BinaryData = New-Object byte[] 16
 
     # --- PACKING DATA ---
     # Group
     $gBytes = [BitConverter]::GetBytes($Group)
-    $BinaryKey[0] = $gBytes[0]
-    $BinaryKey[1] = $gBytes[1]
+    $BinaryData[0] = $gBytes[0]
+    $BinaryData[1] = $gBytes[1]
 
     # Serial (4-bit offset)
     $sBytes = [BitConverter]::GetBytes($Serial)
     for ($i = 0; $i -lt 4; $i++) {
-        $BinaryKey[$i + 2] = [byte]((($sBytes[$i] -band 0x0F) -shl 4) -bor ($BinaryKey[$i + 2] -band 0x0F))
-        if ($i -lt 3) { $BinaryKey[$i + 3] = [byte]($sBytes[$i] -shr 4) }
+        $BinaryData[$i + 2] = [byte]((($sBytes[$i] -band 0x0F) -shl 4) -bor ($BinaryData[$i + 2] -band 0x0F))
+        if ($i -lt 3) { $BinaryData[$i + 3] = [byte]($sBytes[$i] -shr 4) }
     }
 
     # Security (6-bit offset)
     $secBytes = [BitConverter]::GetBytes($Security)
     for ($i = 0; $i -lt 7; $i++) {
-        $BinaryKey[$i + 6] = [byte]((($secBytes[$i] -band 0x3F) -shl 2) -bor ($BinaryKey[$i + 6] -band 0x03))
-        if ($i -lt 7) { $BinaryKey[$i + 7] = [byte]($secBytes[$i] -shr 6) }
+        $BinaryData[$i + 6] = [byte]((($secBytes[$i] -band 0x3F) -shl 2) -bor ($BinaryData[$i + 6] -band 0x03))
+        if ($i -lt 7) { $BinaryData[$i + 7] = [byte]($secBytes[$i] -shr 6) }
     }
 
     # NKey Flag
-    if ($IsNKey) { $BinaryKey[14] = [byte]($BinaryKey[14] -bor 0x08) }
+    if ($IsNKey) { $BinaryData[14] = [byte]($BinaryData[14] -bor 0x08) }
 
     # --- CRC INJECTION ---
     # Call the checksum function
-    $Crc = Get-KeyChecksum -BinaryKey $BinaryKey
+    $Crc = Get-KeyChecksum -BinaryData $BinaryData
 
     # Spread the 10 bits back into the key
-    if ($Crc -band 0x01) { $BinaryKey[12] = [byte]($BinaryKey[12] -bor 0x80) }
-    $BinaryKey[13] = [byte](($Crc -shr 1) -band 0xFF)
-    if ($Crc -band 0x200) { $BinaryKey[14] = [byte]($BinaryKey[14] -bor 0x01) }
+    if ($Crc -band 0x01) { $BinaryData[12] = [byte]($BinaryData[12] -bor 0x80) }
+    $BinaryData[13] = [byte](($Crc -shr 1) -band 0xFF)
+    if ($Crc -band 0x200) { $BinaryData[14] = [byte]($BinaryData[14] -bor 0x01) }
 
-    return $BinaryKey
+    return $BinaryData
 }
 function Get-PidGenXContext {
     [CmdletBinding(DefaultParameterSetName = "String")]
@@ -1530,7 +1537,7 @@ function Get-PidGenXContext {
         [string]$ProductKey,
 
         [Parameter(Mandatory = $true, ParameterSetName = "Bytes")]
-        [byte[]]$BinaryKey,
+        [byte[]]$BinaryData,
 
         [Parameter(Mandatory = $false)]
         [string]$DllPath = "pidgenx.dll"
@@ -1568,7 +1575,7 @@ function Get-PidGenXContext {
 
             # MODE: Low-Level Bit-Parser (Retail Style)
             $pKeyPtr = [Marshal]::AllocHGlobal(0x10)
-            [Marshal]::Copy($BinaryKey, 0, $pKeyPtr, 0x10)
+            [Marshal]::Copy($BinaryData, 0, $pKeyPtr, 0x10)
             $flag = $false
             
             $offset = 0L
@@ -1711,7 +1718,7 @@ function Invoke-IIDRequest {
             @('GetPKeyData',                        'pidgenx.dll', [Int32], @([string], [string], [IntPtr], [IntPtr], [Int64], [String].MakeByRefType(), [Int64].MakeByRefType(), [Int64].MakeByRefType(), [Int64].MakeByRefType(), [IntPtr])),
             @('SLOpen',                             'sppc.dll', [Int32], @([IntPtr].MakeByRefType())),
             @('SLClose',                            'sppc.dll', [Int32], @([IntPtr])),
-            @('SLGenerateOfflineInstallationIdEx',  'sppc.dll', [Int32], @([IntPtr], [Guid].MakeByRefType(), [Int32], [IntPtr].MakeByRefType())),
+            @('SLGenerateOfflineInstallationIdEx',  'sppc.dll', [Int32], @([IntPtr], [Guid].MakeByRefType(), [Int32], [String].MakeByRefType())),
             @('SLDepositOfflineConfirmationId',     'sppc.dll', [Int32], @([IntPtr], [Guid].MakeByRefType(), [IntPtr], [IntPtr]))
 
         ) | % {
@@ -1795,22 +1802,15 @@ function Invoke-IIDRequest {
 
     } elseif ($param -match 'FromAPI') {
 
+        $IID = ""
+
         if ($ApiMode -eq 'SLGenerateOfflineInstallationIdEx' -and (
             $SkuID -and $SkuID -ne [Guid]::Empty)) {
             $hSLC = 0L
-            $Global:OFF::SLOpen([ref]$hSLC) | Out-Null
-            $ppwszInstallation = $null
-            $ppwszInstallationIdPtr = [IntPtr]::Zero
             $pProductSkuId = [Guid]$SkuID
-            $null = $Global:OFF::SLGenerateOfflineInstallationIdEx(
-                $hSLC, [ref]$pProductSkuId, 0, [ref]$ppwszInstallationIdPtr)
-            if ($ppwszInstallationIdPtr -ne [IntPtr]::Zero) {
-                return (
-                    [marshal]::PtrToStringAuto($ppwszInstallationIdPtr)
-                )
-            }
+            $Global:OFF::SLOpen([ref]$hSLC) | Out-Null
+            $Global:OFF::SLGenerateOfflineInstallationIdEx($hSLC, [ref]$pProductSkuId, 0, [ref]$IID) | Out-Null
             $Global:OFF::SLClose($hSLC) | Out-Null
-            return $null
         }
 
         if ($ApiMode -eq 'GetPKeyData') {
@@ -1825,11 +1825,10 @@ function Invoke-IIDRequest {
                 return
             }
             
-            $IID = ""
-            $Req = $Global:OFF::GetPKeyData($Key, $ConfigPath, 0L, 0L, $HWID, [ref]$IID, [ref]0L, [ref]0L, [ref]0L, 0L)
-            if ($Req -ge 0L) { return $IID }
-            return $null
+            $Global:OFF::GetPKeyData($Key, $ConfigPath, 0L, 0L, $HWID, [ref]$IID, [ref]0L, [ref]0L, [ref]0L, 0L) | Out-Null
         }
+
+        return $IID
     }
 }
 #endregion
@@ -2380,10 +2379,10 @@ $LibTSforge = ([PSTypeName]'LibTSforge.SPP.ProductConfig').Type
 Clear-Host
 Write-Host
 
-$EncResult  = Encode-BinaryKey -ProductKey $Key -DllName pidgenx.dll   -CustomPath $pidGen
-#$EncResult = Encode-BinaryKey -ProductKey $Key -DllName ClipSVC.dll   -CustomPath $ClSVC
-#$EncResult = Encode-BinaryKey -ProductKey $Key -DllName clipwinrt.dll -CustomPath $clwinrt
-#$EncResult = Encode-BinaryKey -ProductKey $Key -DllName sppobjs.dll   -CustomPath $objs
+$EncResult  = Encode-BinaryKey -CdKey $Key -DllName pidgenx.dll   -CustomPath $pidGen
+#$EncResult = Encode-BinaryKey -CdKey $Key -DllName ClipSVC.dll   -CustomPath $ClSVC
+#$EncResult = Encode-BinaryKey -CdKey $Key -DllName clipwinrt.dll -CustomPath $clwinrt
+#$EncResult = Encode-BinaryKey -CdKey $Key -DllName sppobjs.dll   -CustomPath $objs
 
 # Recover HWID directly from SPP Store
 if ($LibTSforge) {
@@ -2397,7 +2396,7 @@ if (!([Int64]$hwid.HResult -eq 0L)){
 }
 
 Write-Host "--- AS BINARY OUTPUT ---" -ForegroundColor Cyan
-$EncResult = Encode-BinaryKey -ProductKey $Key -Modern
+$EncResult = Encode-BinaryKey -CdKey $Key -Modern
 Write-Host ("Generated Bytes: {0}" -f $EncResult.HexString)
 Write-Host
 
@@ -2406,15 +2405,15 @@ if ($EncResult.Success) {
     Write-Host "--- API CALL OUTPUT  ---" -ForegroundColor Cyan
     Write-Host "Generated Bytes: $($EncResult.HexString)"
 
-    $Contex = Get-PidGenXContext -BinaryKey $EncResult.BinaryKey -DllPath $clwinrt
-   #$Contex = Get-PidGenXContext -BinaryKey $EncResult.BinaryKey -DllPath $ClSVC
-   #$Contex = Get-PidGenXContext -BinaryKey $EncResult.BinaryKey -DllPath $pidGen
+    $Contex = Get-PidGenXContext -BinaryData $EncResult.Data -DllPath $clwinrt
+   #$Contex = Get-PidGenXContext -BinaryData $EncResult.Data -DllPath $ClSVC
+   #$Contex = Get-PidGenXContext -BinaryData $EncResult.Data -DllPath $pidGen
     Print-PidGenReport -Result $Contex
     Print-PidGenReport -Result $Contex -AsHex
 
-    $pKey = Decode-BinaryKey -BinaryKey $EncResult.BinaryKey -DllPath $winrt
-   #$pKey = Decode-BinaryKey -BinaryKey $EncResult.BinaryKey -DllPath $winob
-   #$pKey = Decode-BinaryKey -BinaryKey $EncResult.BinaryKey -DllPath $comApi
+    $pKey = Decode-BinaryKey -BinaryData $EncResult.Data -DllPath $winrt
+   #$pKey = Decode-BinaryKey -BinaryData $EncResult.Data -DllPath $winob
+   #$pKey = Decode-BinaryKey -BinaryData $EncResult.Data -DllPath $comApi
 
     if ($pKey.Success) {
         Write-Host "`n--- DECODER OUTPUT (Round-Trip) ---" -ForegroundColor Green
@@ -2443,7 +2442,7 @@ if (-not [string]::IsNullOrEmpty($req)) {
 }
 
 $Info = Parse-BinaryKey `
-    -BinaryKey $EncResult.BinaryKey
+    -BinaryData $EncResult.Data
 $Req = Invoke-IIDRequest `
     -GroupID $Info.Group `
     -Serial $Info.Serial `
