@@ -1,5 +1,6 @@
 using namespace System
 using namespace System.IO
+using namespace System.Numerics
 using namespace System.Reflection
 using namespace System.IO.Compression
 using namespace System.Management.Automation
@@ -8,7 +9,7 @@ using namespace System.Runtime.InteropServices
 Clear-Host
 Write-Host
 
-$Key        = "7H674-NPCV7-7QVJ3-RQG68-78T77"
+$Key        = "QPM6N-7J2WJ-P88HH-P3YRH-YY74H"
 $SkuID      = [Guid]'ed655016-a9e8-4434-95d9-4345352c2552'
 $PKeyConfig = "C:\windows\System32\spp\tokens\pkeyconfig\pkeyconfig.xrm-ms"
 
@@ -1336,31 +1337,6 @@ function Decode-BinaryKey {
 }
 
 # Context : pidgenx.dll [ Retail / Insider ] / ClipSVC.dll / clipwinrt.dll
-<#
-Clear-Host
-Write-Host
-
-$Key = 'DXG7C-N36C4-C4HTG-X4T3X-2YV77'
-$BinKey = Encode-BinaryKey -CdKey $Key -Modern
-$info = Parse-BinaryKey -BinaryData $BinKey.Data
-$Source = [System.BitConverter]::ToString($BinKey.Data)
-
-$Key
-$Source
-$info | Format-Table
-
-$pKey = Pack-BinaryKey -Group $info.Group -Serial $info.Serial -Security $info.Security -IsNKey $true
-$newKey = Decode-BinaryKey -BinaryData $pKey -Modern
-$New = [System.BitConverter]::ToString($pKey)
-
-$newKey
-$New
-Parse-BinaryKey -BinaryData $pKey | Format-Table
-
-Write-Host ("Binary -> IS MAtch ? {0}" -f ($Source -eq $new)) -ForegroundColor Green
-Write-Host ("Key    -> IS MAtch ? {0}" -f ($newKey -eq $Key)) -ForegroundColor Green
-Write-Host
-#>
 $CrcTable = @(
 0x00000000, 0x04C11DB7, 0x09823B6E, 0x0D4326D9, 0x130476DC, 0x17C56B6B, 0x1A864DB2, 0x1E475005,
 0x2608EDB8, 0x22C9F00F, 0x2F8AD6D6, 0x2B4BCB61, 0x350C9B64, 0x31CD86D3, 0x3C8EA00A, 0x384FBDBD,
@@ -1436,99 +1412,180 @@ function Get-KeyChecksum {
     
     return $FinalCRC
 }
-function Parse-BinaryKey {
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory = $true)]
-        [byte[]]$BinaryData
-    )
-    
-    # Pidgenx.dll, Retail Version, sub_180020A1C
-    # Take Binary Key ANd make it Struct,
-    # $group    = [Marshal]::ReadInt32(a2, 0x00)
-    # $serial   = [Marshal]::ReadInt32(a2, 0x04)
-    # $security = [Marshal]::ReadInt32(a2, 0x10)
-
-    # 1. Group ID: Straight UInt16
-    $groupId = [BitConverter]::ToUInt16($BinaryData, 0)
-
-    # 2. Serial Logic: Fixed with 0xFF mask
-    $serialBytes = New-Object byte[] 4 
-    for ($i = 0; $i -lt 3; $i++) {
-        # Mask the result to 8 bits to stay within [byte] limits
-        $rawSerial = (($BinaryData[$i + 3] -band 0xFF) -shl 4) -bor ($BinaryData[$i + 2] -shr 4)
-        $serialBytes[$i] = [byte]($rawSerial -band 0xFF)
-    }
-    $serial = [BitConverter]::ToUInt32($serialBytes, 0)
-
-    # 3. Security Logic: Fixed with 0xFF mask
-    $securityBytes = New-Object byte[] 8
-    for ($i = 0; $i -lt 6; $i++) {
-        # Mask the result to 8 bits to stay within [byte] limits
-        $rawSec = (($BinaryData[$i + 7] -band 0xFF) -shl 6) -bor ($BinaryData[$i + 6] -shr 2)
-        $securityBytes[$i] = [byte]($rawSec -band 0xFF)
-    }
-    $security = [BitConverter]::ToUInt64($securityBytes, 0)
-
-    # 4. Modern N Flag
-    $isNKey = ($BinaryData[14] -band 0x08) -ne 0
-
-    return [Psobject]@{
-        Group    = $groupId
-        Serial   = $serial
-        Security = $security
-        IsNKey   = $isNKey
-    }
-}
 function Pack-BinaryKey {
     param (
         [uint16]$Group,
         [uint32]$Serial,
         [uint64]$Security,
-        [bool]$IsNKey
+        [bool]$IsNKey = $true,
+        [bool]$Stream = $true
     )
+    function Set-Bits {
+        param(
+            [byte[]]$Data,
+            [int]$StartBit,
+            [uint64]$Value,
+            [int]$Count
+        )
 
-    # Pidgenx.dll, Retail Version, sub_180020A1C
-    # Take Binary Key ANd make it Struct,
-    # $group    = [Marshal]::ReadInt32(a2, 0x00)
-    # $serial   = [Marshal]::ReadInt32(a2, 0x04)
-    # $security = [Marshal]::ReadInt32(a2, 0x10)
+        for ($i = 0; $i -lt $Count; $i++) {
 
-    $BinaryData = New-Object byte[] 16
+            if ($Value -band ([uint64]1 -shl $i)) {
 
-    # --- PACKING DATA ---
-    # Group
-    $gBytes = [BitConverter]::GetBytes($Group)
-    $BinaryData[0] = $gBytes[0]
-    $BinaryData[1] = $gBytes[1]
+                $bit = $StartBit + $i
 
-    # Serial (4-bit offset)
-    $sBytes = [BitConverter]::GetBytes($Serial)
-    for ($i = 0; $i -lt 4; $i++) {
-        $BinaryData[$i + 2] = [byte]((($sBytes[$i] -band 0x0F) -shl 4) -bor ($BinaryData[$i + 2] -band 0x0F))
-        if ($i -lt 3) { $BinaryData[$i + 3] = [byte]($sBytes[$i] -shr 4) }
+                $byteIndex = $bit -shr 3
+                $bitIndex  = $bit -band 7
+
+                $Data[$byteIndex] = $Data[$byteIndex] -bor ([byte](1 -shl $bitIndex))
+            }
+        }
     }
+    if ($Stream) {
 
-    # Security (6-bit offset)
-    $secBytes = [BitConverter]::GetBytes($Security)
-    for ($i = 0; $i -lt 7; $i++) {
-        $BinaryData[$i + 6] = [byte]((($secBytes[$i] -band 0x3F) -shl 2) -bor ($BinaryData[$i + 6] -band 0x03))
-        if ($i -lt 7) { $BinaryData[$i + 7] = [byte]($secBytes[$i] -shr 6) }
+        # 1. Initialize a 128-bit BigInt
+        [BigInteger]$Key = 0
+
+        # 2. Pack fields using Bitwise OR and Shift (The "Compiler Style")
+        $Key = $Key -bor [BigInteger]$Group
+        $Key = $Key -bor ([BigInteger]($Serial -band 0x3FFFFFFF) -shl 20)
+        $Key = $Key -bor ([BigInteger]($Security -band 0x1FFFFFFFFFFFFF) -shl 50)
+
+        if ($IsNKey) {
+            # Bit 115 (Byte 14, Bit 3) -> 1 -shl 115
+            $Key = $Key -bor ([BigInteger]1 -shl 115)
+        }
+
+        # 3. Convert to 16-byte array for CRC calculation
+        $BinaryData = $Key.ToByteArray()
+        if ($BinaryData.Length -lt 16) { $BinaryData += ,0 * (16 - $BinaryData.Length) }
+        $BinaryData = $BinaryData[0..15] # Ensure exactly 16 bytes
+
+        # 4. Calculate CRC (using your existing function)
+        $crc = Get-KeyChecksum -BinaryData $BinaryData
+
+        # 5. Tuck CRC bits into the specific slots (Bits 103, 104-111, 112)
+        # Bit 0 of CRC -> Bit 103 (Byte 12, Bit 7)
+        if ($crc -band 0x01) { $BinaryData[12] = $BinaryData[12] -bor 0x80 }
+    
+        # Bits 1-8 of CRC -> Byte 13
+        $BinaryData[13] = [byte](($crc -shr 1) -band 0xFF)
+    
+        # Bit 9 of CRC -> Bit 112 (Byte 14, Bit 0)
+        if ($crc -band 0x200) { $BinaryData[14] = $BinaryData[14] -bor 0x01 }
     }
+    if (!$Stream) {
+        
+        #
+        # Canonical field layout
+        #
 
-    # NKey Flag
-    if ($IsNKey) { $BinaryData[14] = [byte]($BinaryData[14] -bor 0x08) }
+        $GROUP_OFFSET    = 0
+        $SERIAL_OFFSET   = 20
+        $SERIAL_BITS     = 30
+        $SECURITY_OFFSET = 50
+        $SECURITY_BITS   = 53
 
-    # --- CRC INJECTION ---
-    # Call the checksum function
-    $Crc = Get-KeyChecksum -BinaryData $BinaryData
+        $BinaryData = [byte[]]::new(16)
 
-    # Spread the 10 bits back into the key
-    if ($Crc -band 0x01) { $BinaryData[12] = [byte]($BinaryData[12] -bor 0x80) }
-    $BinaryData[13] = [byte](($Crc -shr 1) -band 0xFF)
-    if ($Crc -band 0x200) { $BinaryData[14] = [byte]($BinaryData[14] -bor 0x01) }
+        #
+        # Group
+        #
 
+        [BitConverter]::GetBytes($Group).CopyTo($BinaryData, 0)
+
+        #
+        # Serial + Security
+        #
+
+        Set-Bits $BinaryData $SERIAL_OFFSET   ([uint64]$Serial)   $SERIAL_BITS
+        Set-Bits $BinaryData $SECURITY_OFFSET ([uint64]$Security) $SECURITY_BITS
+
+        #
+        # N-Key flag
+        #
+
+        if ($IsNKey) {
+            $BinaryData[14] = $BinaryData[14] -bor 0x08
+        }
+
+        #
+        # CRC10
+        #
+
+        $crc = Get-KeyChecksum -BinaryData $BinaryData
+
+        if ($crc -band 0x001) {
+            $BinaryData[12] = $BinaryData[12] -bor 0x80
+        }
+
+        $BinaryData[13] = [byte](($crc -shr 1) -band 0xFF)
+
+        if ($crc -band 0x200) {
+            $BinaryData[14] = $BinaryData[14] -bor 0x01
+        }
+    }
     return $BinaryData
+}
+function Parse-BinaryKey {
+    param([
+        byte[]]$BinaryData,
+        [bool]$Stream = $true
+    )
+    function Get-Bits {
+        param(
+            [byte[]]$Data,
+            [int]$StartBit,
+            [int]$Count
+        )
+
+        [uint64]$result = 0
+
+        for ($i = 0; $i -lt $Count; $i++) {
+
+            $bit = $StartBit + $i
+
+            $byteIndex = $bit -shr 3
+            $bitIndex  = $bit -band 7
+
+            if ($Data[$byteIndex] -band ([byte](1 -shl $bitIndex))) {
+                $result = $result -bor ([uint64]1 -shl $i)
+            }
+        }
+
+        return $result
+    }
+    if ($Stream) {
+
+        # 1. Load the bytes into a single BigInteger (Treat as unsigned)
+        # We add a 0x00 at the end to force BigInteger to treat it as positive
+        $TempBytes = $BinaryData[0..15] + [byte]0
+        $Value = [BigInteger]::new($TempBytes)
+
+        # 2. Extract fields using Mask and Shift (Zero loops!)
+        return [PSCustomObject][Ordered]@{
+            Group    = [uint16]($Value -band 0xFFFF)
+            Serial   = [uint32](($Value -shr 20) -band 0x3FFFFFFF)
+            Security = [uint64](($Value -shr 50) -band 0x1FFFFFFFFFFFFF)
+            IsNKey   = (($Value -shr 115) -band 1) -eq 1
+            Checksum = [int](Get-KeyChecksum $BinaryData)
+        }
+    }
+    if (!$Stream) {
+
+        $GROUP_OFFSET    = 0
+        $SERIAL_OFFSET   = 20
+        $SERIAL_BITS     = 30
+        $SECURITY_OFFSET = 50
+        $SECURITY_BITS   = 53
+
+        return [PSCustomObject][Ordered]@{
+            Group    = [BitConverter]::ToUInt16($BinaryData, 0)
+            Serial   = [uint32](Get-Bits $BinaryData $SERIAL_OFFSET $SERIAL_BITS)
+            Security = Get-Bits $BinaryData $SECURITY_OFFSET $SECURITY_BITS
+            IsNKey   = (($BinaryData[14] -band 0x08) -ne 0)
+        }
+    }
 }
 function Get-PidGenXContext {
     [CmdletBinding(DefaultParameterSetName = "String")]
@@ -1618,7 +1675,7 @@ function Get-PidGenXContext {
 
             return [PSCustomObject]@{
                 Success      = $true
-                GroupID      = $group
+                Group        = $group
                 Serial       = $serial
                 Security     = $security
                 RawStruct    = $rawBytes
@@ -1932,7 +1989,7 @@ function Print-PidGenReport {
         if (-not $AsHex) {
             Write-Host "`n[+] PID Decoder Success" -ForegroundColor Green
             Write-Host "---------------------------"
-            Write-Host "Group ID : $($Result.GroupID)"
+            Write-Host "Group    : $($Result.Group)"
             Write-Host "Serial   : $($Result.Serial)"
             Write-Host "Security : $($Result.Security)"
             Write-Host "---------------------------"
@@ -1964,6 +2021,86 @@ Function InstallModule {
         Remove-Item -Path $tempFolder -Recurse -Force | Out-Null
     } catch {
     }
+}
+Function Test-Keys {
+    param (
+        [uint16]$Group,
+        [uint32]$Serial,
+        [uint64]$Security,
+        [bool]$UseApi = $false,
+        [Bool]$Stream = $true
+    )
+
+    <#
+      Test-Keys -Group 0     -Serial 0          -Security 0                #-UseApi
+      Test-Keys -Group 1     -Serial 1          -Security 1                #-UseApi
+      Test-Keys -Group 3861  -Serial 0          -Security 5672106590105222 #-UseApi # 44RPN-FTY23-9VTTB-MP9BX-T84FV
+      Test-Keys -Group 65535 -Serial 9999999    -Security 99999999999999   #-UseApi
+      Test-Keys -Group 65535 -Serial 1073741823 -Security 9007199254740991 #-UseApi
+    #>
+
+    Write-Host "Encode-Key`n" -ForegroundColor Magenta
+    $Key = Encode-Key -group $Group -serial $Serial -security $security
+    $info = Decode-Key -Key $Key
+    $nKey = Encode-Key -group $info.Group -serial $info.Serial -security $info.Security
+    $Key, $nKey
+    if ($info.Group -ne $Group) {
+        Write-Warning "Failed Valication: Group"
+    }
+    if ($info.Serial -ne $Serial) {
+        Write-Warning "Failed Valication: Serial"
+    }
+    if ($info.Security -ne $Security) {
+        Write-Warning "Failed Valication: Security"
+    }
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    Write-Host "`nKeyEncode`n" -ForegroundColor Magenta
+    $Key = KeyEncode -sgroupid $Group -skeyid $Serial -sunk $security
+    $infoObj = KeyDecode -key0 $Key
+    $Info = [PsObject]@{
+        Group    = $infoObj[2].Value
+        Serial   = $infoObj[0].Value
+        security = $infoObj[3].Value
+    }
+    $nKey = KeyEncode -sgroupid $Info.Group -skeyid $Info.Serial -sunk $Info.security
+    $Key, $nKey
+    if ($info.Group -ne $Group) {
+        Write-Warning "Failed Valication: Group"
+    }
+    if ($info.Serial -ne $Serial) {
+        Write-Warning "Failed Valication: Serial"
+    }
+    if ($info.Security -ne $Security) {
+        Write-Warning "Failed Valication: Security"
+    }
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    Write-Host "`nPS1 New Code`n" -ForegroundColor Green
+    if ($UseApi) {
+      $Key  = Decode-BinaryKey -BinaryData (Pack-BinaryKey -Group $Group -Serial $Serial -Security $security -Stream $Stream) -DllPath $winrt | select -ExpandProperty ProductKey
+      $info = Get-PidGenXContext -BinaryData (Encode-BinaryKey -CdKey $Key -DllName pidgenx.dll -CustomPath $pidGen | select -ExpandProperty Data) -DllPath $clwinrt
+      $nKey = Decode-BinaryKey -BinaryData (Pack-BinaryKey -Group $info.Group -Serial $info.Serial -Security $info.Security -Stream $Stream) -DllPath $winrt | select -ExpandProperty ProductKey
+    } else {
+      $Key  = Decode-BinaryKey -BinaryData (Pack-BinaryKey -Group $Group -Serial $Serial -Security $security -Stream $Stream) -Modern
+      $info = Parse-BinaryKey -BinaryData (Encode-BinaryKey -CdKey $Key -Modern | select -ExpandProperty Data) -Stream $Stream
+      $nKey = Decode-BinaryKey -BinaryData (Pack-BinaryKey -Group $info.Group -Serial $info.Serial -Security $info.Security -Stream $Stream) -Modern
+    }
+
+    $Key, $nKey
+    if ($info.Group -ne $Group) {
+        Write-Warning "Failed Valication: Group"
+    }
+    if ($info.Serial -ne $Serial) {
+        Write-Warning "Failed Valication: Serial"
+    }
+    if ($info.Security -ne $Security) {
+        Write-Warning "Failed Valication: Security"
+    }
+
+    Write-Host
 }
 #endregion
 #region "RVA"
