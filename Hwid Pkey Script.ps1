@@ -1,35 +1,11 @@
 using namespace System
 using namespace System.IO
+using namespace System.Text
 using namespace System.Numerics
 using namespace System.Reflection
 using namespace System.IO.Compression
 using namespace System.Management.Automation
 using namespace System.Runtime.InteropServices
-
-Clear-Host
-Write-Host
-
-$Key        = "QPM6N-7J2WJ-P88HH-P3YRH-YY74H"
-$SkuID      = [Guid]'ed655016-a9e8-4434-95d9-4345352c2552'
-$PKeyConfig = "C:\windows\System32\spp\tokens\pkeyconfig\pkeyconfig.xrm-ms"
-
-$pidGen  = (Join-Path $PSScriptRoot "pidgenx.dll")
-$objs    = (Join-Path $PSScriptRoot "sppobjs.dll")
-$ClSVC   = (Join-Path $PSScriptRoot "ClipSVC.dll")
-$winob   = (Join-Path $PSScriptRoot "sppwinob.dll")
-$pidIns  = (Join-Path $PSScriptRoot "pidgenxIn.dll")
-$comApi  = (Join-Path $PSScriptRoot "SppComApi.dll")
-$clwinrt = (Join-Path $PSScriptRoot "clipwinrt.dll")
-$winRT   = (Join-Path $PSScriptRoot "LicensingWinRT.dll")
-
-$ClSVC   = if (Test-Path $ClSVC)   { $ClSVC  }  else { "$env:windir\system32\ClipSVC.dll" }
-$objs    = if (Test-Path $objs)    { $objs   }  else { "$env:windir\system32\sppobjs.dll"  }
-$winob   = if (Test-Path $winob)   { $winob  }  else { "$env:windir\system32\sppwinob.dll" }
-$pidGen  = if (Test-Path $pidGen)  { $pidGen }  else { "$env:windir\system32\pidgenx.dll"  }
-$comApi  = if (Test-Path $comApi)  { $comApi }  else { "$env:windir\system32\SppComApi.dll" }
-$clwinrt = if (Test-Path $clwinrt) { $clwinrt } else { "$env:windir\system32\clipwinrt.dll" }
-$winRT   = if (Test-Path $winRT)   { $winRT  }  else { "$env:windir\system32\LicensingWinRT.dll" }
-$pidIns  = if (Test-Path $pidIns)  { $pidIns }  else { Write-Warning "Pidgex Insider Not found .!" }
 
 #region HWID
 # API: LicensingWinRT.dll
@@ -153,7 +129,7 @@ function Get-ProductHWID {
         }
     }
     catch {
-        Write-Error $_.Exception.Message
+        Write-Warning $_.Exception.Message
     }
     finally {
         # Clean up CdKey pointer if it was created
@@ -835,7 +811,7 @@ function Parse-abCdKey {
         }
     }
     if (-not $SkuIDList) {
-        Write-Error "Invalid Sku List Object"
+        Write-warning "Invalid Sku List Object"
         return
     }
     $Results = New-Object System.Collections.Generic.List[PSCustomObject]
@@ -2490,6 +2466,27 @@ function Get-ContextRVA {
 }
 #endregion
 
+Clear-Host
+Write-Host
+
+$pidGen  = (Join-Path $PSScriptRoot "pidgenx.dll")
+$objs    = (Join-Path $PSScriptRoot "sppobjs.dll")
+$ClSVC   = (Join-Path $PSScriptRoot "ClipSVC.dll")
+$winob   = (Join-Path $PSScriptRoot "sppwinob.dll")
+$pidIns  = (Join-Path $PSScriptRoot "pidgenxIn.dll")
+$comApi  = (Join-Path $PSScriptRoot "SppComApi.dll")
+$clwinrt = (Join-Path $PSScriptRoot "clipwinrt.dll")
+$winRT   = (Join-Path $PSScriptRoot "LicensingWinRT.dll")
+
+$ClSVC   = if (Test-Path $ClSVC)   { $ClSVC  }  else { "$env:windir\system32\ClipSVC.dll" }
+$objs    = if (Test-Path $objs)    { $objs   }  else { "$env:windir\system32\sppobjs.dll"  }
+$winob   = if (Test-Path $winob)   { $winob  }  else { "$env:windir\system32\sppwinob.dll" }
+$pidGen  = if (Test-Path $pidGen)  { $pidGen }  else { "$env:windir\system32\pidgenx.dll"  }
+$comApi  = if (Test-Path $comApi)  { $comApi }  else { "$env:windir\system32\SppComApi.dll" }
+$clwinrt = if (Test-Path $clwinrt) { $clwinrt } else { "$env:windir\system32\clipwinrt.dll" }
+$winRT   = if (Test-Path $winRT)   { $winRT  }  else { "$env:windir\system32\LicensingWinRT.dll" }
+$pidIns  = if (Test-Path $pidIns)  { $pidIns }  else { Write-Warning "Pidgex Insider Not found .!" }
+
 $adminRequired = [Security.Principal.WindowsIdentity]::GetCurrent()
 $adminRole = [Security.Principal.WindowsPrincipal]$adminRequired
 if (-not $adminRole.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -2513,6 +2510,20 @@ if (!([PSTypeName]'LibTSforge.SPP.ProductConfig').Type) {
 }
 $LibTSforge = ([PSTypeName]'LibTSforge.SPP.ProductConfig').Type
 
+try {
+    $SppData = (Get-SppStoreLicense -SkuType Windows -IgnoreEsu -Export)
+    $SkuID   = [Guid]($SppData.SkuId)
+    $Key     = ([Encoding]::Unicode.GetString(([regex]::Matches($SppData.SppPkeyBindingProductKey, '..') | ForEach-Object { [Convert]::ToByte($_.Value, 16) }))).TrimEnd([char]0)
+} catch {
+    $pKeyBytes  = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" `
+                    -Name "DigitalProductId4" -ErrorAction Stop) | Select-Object -ExpandProperty DigitalProductId4
+    $SkuID      = [Guid][Encoding]::Unicode.GetString($pKeyBytes[0x88..0xCF])
+    $Key        = Decode-BinaryKey -BinaryData ($pKeyBytes[808..822]) -Modern
+}
+
+# Default Config File
+$PKeyConfig = "C:\windows\System32\spp\tokens\pkeyconfig\pkeyconfig.xrm-ms"
+
 Clear-Host
 Write-Host
 
@@ -2524,7 +2535,8 @@ $EncResult  = Encode-BinaryKey -CdKey $Key -DllName pidgenx.dll   -CustomPath $p
 # Recover HWID directly from SPP Store
 if ($LibTSforge) {
     $hwid = Get-ProductHWID -FromStore
-} elseif (-not $hwid) {
+}
+if (-not $hwid) {
     # Generate new one using Internal Api
     $hwid = Get-ProductHWID -DllPath $winRT
 }
